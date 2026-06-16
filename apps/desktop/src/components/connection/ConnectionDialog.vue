@@ -1948,7 +1948,7 @@ async function browseDbFilePath() {
           ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }]
           : form.value.db_type === "h2"
             ? [{ name: "H2", extensions: ["db"] }]
-            : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
+            : [{ name: "SQLite", extensions: ["db", "db3", "sqlite", "sqlite3"] }];
     const selected = await open({
       title: "Select Database File",
       multiple: false,
