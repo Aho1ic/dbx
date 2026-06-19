@@ -131,7 +131,6 @@ import { useCellDetailEditor, type UseCellDetailEditorReturn } from "@/composabl
 import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { nextDataGridSortState, type DataGridSortDirection } from "@/lib/dataGridSort";
-import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { forgetDataGridConditionHistory, loadDataGridConditionHistory, rememberDataGridConditionHistory } from "@/lib/dataGridConditionHistory";
 
 const SqlPreviewPanel = defineAsyncComponent(() => import("@/components/editor/SqlPreviewPanel.vue"));
@@ -141,7 +140,6 @@ const slots = useSlots();
 const settingsStore = useSettingsStore();
 const { isDark } = useTheme();
 const { toast } = useToast();
-const { highlight } = useSqlHighlighter();
 const binaryCellDownloadMenuItems = computed(() =>
   BINARY_CELL_DOWNLOAD_MODES.map((mode) => ({
     label: t(`grid.binaryDownload.${mode}`),
