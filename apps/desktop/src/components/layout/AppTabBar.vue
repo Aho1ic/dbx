@@ -216,6 +216,7 @@ function tabColorStyle(tab: QueryTab) {
 }
 
 function tabIconClass(tab: QueryTab) {
+  if (tab.mode === "tableInfo") return "text-foreground";
   if (tab.mode === "data" || tab.mode === "mongo" || tab.mode === "vector" || tab.mode === "redis" || tab.mode === "objects" || tab.mode === "structure") return "text-emerald-600 dark:text-emerald-400";
   return "text-blue-600 dark:text-blue-400";
 }
@@ -236,7 +237,7 @@ function tabMenuIcon(tab: QueryTab) {
   if (tab.mode === "data" || tab.mode === "mongo" || tab.mode === "redis") return Table2;
   if (tab.mode === "vector") return TableProperties;
   if (tab.mode === "etcd") return KeyRound;
-  if (tab.mode === "objects") return TableProperties;
+  if (tab.mode === "objects" || tab.mode === "tableInfo") return TableProperties;
   if (tab.mode === "structure") return PencilRuler;
   return Code2;
 }
@@ -329,7 +330,7 @@ function activateTab(tabId: string) {
                     <Table2 v-if="tab.mode === 'data' || tab.mode === 'mongo' || tab.mode === 'redis'" class="h-3.5 w-3.5" />
                     <TableProperties v-else-if="tab.mode === 'vector'" class="h-3.5 w-3.5" />
                     <KeyRound v-else-if="tab.mode === 'etcd'" class="h-3.5 w-3.5" />
-                    <TableProperties v-else-if="tab.mode === 'objects'" class="h-3.5 w-3.5" />
+                    <TableProperties v-else-if="tab.mode === 'objects' || tab.mode === 'tableInfo'" class="h-3.5 w-3.5" />
                     <PencilRuler v-else-if="tab.mode === 'structure'" class="h-3.5 w-3.5" />
                     <Code2 v-else class="h-3.5 w-3.5" />
                   </span>

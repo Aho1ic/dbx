@@ -550,9 +550,16 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "vector" | "etcd" | "mq" | "objects" | "structure" | "users";
+  mode: "data" | "query" | "redis" | "mongo" | "vector" | "etcd" | "mq" | "objects" | "structure" | "users" | "tableInfo";
   mqTenant?: string;
   structureTableName?: string;
+  tableInfoTarget?: {
+    schema?: string;
+    tableName: string;
+    columns: ColumnInfo[];
+    primaryKeys: string[];
+  };
+  tableInfoActiveTab?: "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
   objectBrowser?: {
     schema?: string;
     objectType?: "tables";

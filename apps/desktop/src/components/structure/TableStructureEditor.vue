@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Database, Info, KeyRound, Loader2, Maximize2, Plus, RefreshCw, Save, SlidersHorizontal, Trash2, X } from "@lucide/vue";
+import { AlertTriangle, Check, ChevronDown, ChevronUp, Code, Copy, Database, Info, KeyRound, Loader2, Maximize2, Plus, RefreshCw, Save, SlidersHorizontal, Table, Trash2, X } from "@lucide/vue";
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -82,6 +82,7 @@ const emit = defineEmits<{
 }>();
 
 const activeTab = ref("columns");
+const columnViewMode = ref<"edit" | "ddl">("edit");
 const loading = ref(false);
 const saving = ref(false);
 const sqlPreviewLoading = ref(false);
@@ -1019,7 +1020,12 @@ watch(activeTab, (tab) => {
                   </SelectContent>
                 </Select>
               </div>
-              <Button v-if="activeTab === 'columns'" size="sm" :class="structureToolbarButtonClass" :disabled="!canAddColumn" @click="addColumn">
+              <Button v-if="activeTab === 'columns'" variant="ghost" size="sm" :class="structureToolbarButtonClass" :title="columnViewMode === 'edit' ? t('structureEditor.ddlView') : t('structureEditor.editView')" @click="columnViewMode = columnViewMode === 'edit' ? 'ddl' : 'edit'">
+                <Code v-if="columnViewMode === 'edit'" :class="structureIconClass" />
+                <Table v-else :class="structureIconClass" />
+                {{ columnViewMode === "edit" ? t("structureEditor.ddlView") : t("structureEditor.editView") }}
+              </Button>
+              <Button v-if="activeTab === 'columns'" size="sm" :class="structureToolbarButtonClass" :disabled="!structureCapabilities.addColumn" @click="addColumn">
                 <Plus :class="structureIconClass" />
                 {{ t("structureEditor.addColumn") }}
               </Button>
@@ -1038,8 +1044,52 @@ watch(activeTab, (tab) => {
             </div>
           </div>
 
-          <TabsContent v-if="tableMetadataCapabilities.columns" value="columns" class="m-0 min-h-0 flex-1 overflow-auto p-0">
-            <table class="border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+          <TabsContent value="columns" class="m-0 min-h-0 flex-1 overflow-auto p-0">
+            <table v-if="columnViewMode === 'ddl'" class="min-w-full border-separate border-spacing-0 text-[11px]">
+              <thead class="sticky top-0 z-10 bg-background">
+                <tr>
+                  <th class="min-w-32 border-b border-r px-2 py-1.5 text-left font-mono">
+                    {{ t("structureEditor.columnName") }}
+                  </th>
+                  <th class="min-w-40 border-b border-r px-2 py-1.5 text-left font-mono">
+                    {{ t("structureEditor.dataType") }}
+                  </th>
+                  <th class="min-w-36 border-b border-r px-2 py-1.5 text-left font-mono">
+                    {{ t("structureEditor.defaultValue") }}
+                  </th>
+                  <th class="min-w-48 border-b px-2 py-1.5 text-left font-mono">
+                    {{ t("structureEditor.comment") }}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="column in columns" :key="column.id" :class="column.markedForDrop ? 'bg-destructive/5 opacity-60' : ''">
+                  <td class="border-b border-r px-2 py-1 font-mono">
+                    <span :class="column.markedForDrop ? 'line-through' : ''">
+                      <KeyRound v-if="column.isPrimaryKey" class="mr-1 inline h-3 w-3 text-amber-500" />
+                      {{ column.name }}
+                    </span>
+                    <span v-if="!column.isNullable" class="ml-1 text-[10px] text-muted-foreground">
+                      {{ t("structureEditor.notNull") }}
+                    </span>
+                  </td>
+                  <td class="border-b border-r px-2 py-1 font-mono">
+                    <span :class="column.markedForDrop ? 'line-through' : ''">{{ column.dataType }}</span>
+                  </td>
+                  <td class="border-b border-r px-2 py-1 font-mono">
+                    <span :class="column.markedForDrop ? 'line-through' : ''">
+                      {{ column.defaultValue || t("structureEditor.noDefault") }}
+                    </span>
+                  </td>
+                  <td class="border-b px-2 py-1">
+                    <span :class="column.markedForDrop ? 'line-through' : ''">
+                      {{ column.comment || t("structureEditor.noDefault") }}
+                    </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <table v-else class="border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th v-for="(columnLabel, i) in colLabels" :key="columnLabel.key" :class="[structureHeaderCellClass, { 'text-center': columnLabel.key === 'primaryKey' }]" :style="{ width: visibleColWidths[i] + 'px', minWidth: visibleColWidths[i] + 'px' }">

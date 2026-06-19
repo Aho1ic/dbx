@@ -1,6 +1,5 @@
 <script lang="ts">
 import { ref, shallowRef } from "vue";
-const globalDdlOpen = ref(false);
 type CachedStructuredFilterRule = {
   id: string;
   columnName: string;
@@ -18,7 +17,7 @@ const structuredFilterStateCache = new Map<string, StructuredFilterCacheState>()
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, onActivated, onDeactivated, useSlots, watch, defineAsyncComponent, type Component, type CSSProperties } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, onActivated, onDeactivated, useSlots, watch, defineAsyncComponent, type CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   ArrowUp,
@@ -42,7 +41,6 @@ import {
   Loader2,
   X,
   Undo2,
-  WrapText,
   Info,
   Rows3,
   RefreshCcw,
@@ -53,8 +51,6 @@ import {
   SquareDashed,
   Check,
   CopyPlus,
-  KeyRound,
-  Link2,
   ListTree,
   Maximize2,
   PanelBottom,
@@ -79,7 +75,7 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ImagePreviewDialog from "@/components/grid/ImagePreviewDialog.vue";
 import TemporalCellEditor from "@/components/grid/TemporalCellEditor.vue";
 import EnumCellEditor from "@/components/grid/EnumCellEditor.vue";
-import type { QueryResult, ColumnInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo, TableInfoTab } from "@/types/database";
+import type { QueryResult, ColumnInfo, DatabaseType } from "@/types/database";
 import * as api from "@/lib/api";
 import { coerceDataGridCellValue, dataGridCellDisplayText, dataGridCellEditorText } from "@/lib/dataGridCellCoercion";
 import { createColumnDrafts } from "@/lib/tableStructureEditorState";
@@ -131,7 +127,6 @@ import ExportProgressDialog from "@/components/export/ExportProgressDialog.vue";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { useDataGridSelection } from "@/composables/useDataGridSelection";
 import { useDataGridEditor } from "@/composables/useDataGridEditor";
-import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useCellDetailEditor, type UseCellDetailEditorReturn } from "@/composables/useCellDetailEditor";
 import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -153,6 +148,7 @@ const binaryCellDownloadMenuItems = computed(() =>
     value: mode,
   })),
 );
+const DATA_GRID_BOTTOM_SPACER_HEIGHT = 48;
 
 interface PreparedCopyValue {
   key: string;
@@ -187,7 +183,6 @@ const props = defineProps<{
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
-  tableInfoTab?: TableInfoTab;
   pageOffset?: number;
   pageLimit?: number;
   countSql?: string;
@@ -1622,38 +1617,6 @@ watch(allNullColumnIndexesForResult, () => {
 const firstVisibleColumnIndex = computed(() => visibleColumnIndexes.value[0] ?? 0);
 function actualColumnIndex(visibleColumnIndex: number): number {
   return visibleColumnIndexes.value[visibleColumnIndex] ?? visibleColumnIndex;
-}
-function matchesTableInfoColumn(resultColumn: string, sourceColumn: string | undefined, columnName: string): boolean {
-  const target = columnName.toLocaleLowerCase();
-  return resultColumn.toLocaleLowerCase() === target || sourceColumn?.toLocaleLowerCase() === target;
-}
-function scrollToTableInfoColumn(columnName: string) {
-  const columnIndex = props.result.columns.findIndex((column, index) => matchesTableInfoColumn(column, props.sourceColumns?.[index], columnName));
-  if (columnIndex < 0 || !displayableColumnIndexes.value.includes(columnIndex)) return;
-
-  if (hiddenColumnIndexes.value.has(columnIndex)) {
-    hiddenColumnIndexes.value.delete(columnIndex);
-    hiddenColumnIndexes.value = new Set(hiddenColumnIndexes.value);
-  }
-
-  highlightedColumnIndex.value = columnIndex;
-  clearTimeout(highlightedColumnTimer);
-  highlightedColumnTimer = window.setTimeout(() => {
-    highlightedColumnIndex.value = null;
-  }, 1400);
-
-  nextTick(() => {
-    const visibleColIdx = visibleColumnIndexes.value.indexOf(columnIndex);
-    const scroller = gridRef.value?.querySelector<HTMLElement>(".data-grid-scroller");
-    if (visibleColIdx < 0 || !scroller) return;
-
-    const targetLeft = Math.max(0, columnContentOffsetLeft(visibleColIdx) - scroller.clientWidth / 2 + (renderedColumnWidths.value[visibleColIdx] ?? 0) / 2);
-    scroller.scrollLeft = targetLeft;
-    updateGridHorizontalViewport(scroller);
-    if (headerRef.value) {
-      headerRef.value.scrollLeft = scroller.scrollLeft;
-    }
-  });
 }
 
 // --- Column resize composable ---
@@ -4531,9 +4494,13 @@ function hasNativeClipboardSelection(): boolean {
   return !!anchorRegion && anchorRegion === focusRegion;
 }
 
-function eventTargetAllowsNativeClipboard(event: KeyboardEvent): boolean {
+function eventTargetAllowsNativeTextEditing(event: Event): boolean {
   const target = event.target as HTMLElement | null;
-  if (target?.closest("input, textarea, [contenteditable='true'], [role='textbox']")) return true;
+  return !!target?.closest("input, textarea, [contenteditable='true'], [role='textbox']");
+}
+
+function eventTargetAllowsNativeClipboard(event: KeyboardEvent): boolean {
+  if (eventTargetAllowsNativeTextEditing(event)) return true;
   return clipboardShortcut(event, "c") && hasNativeClipboardSelection();
 }
 
@@ -4581,6 +4548,7 @@ function pasteTextIntoSelection(text: string): boolean {
 }
 
 function onGridPaste(event: ClipboardEvent) {
+  if (eventTargetAllowsNativeTextEditing(event)) return;
   if (!props.editable || (!selectedRange.value && !hasColumnSelection.value)) return;
   const target = event.target as HTMLElement | null;
   if (target?.closest("input, textarea, [contenteditable='true'], [role='textbox']")) return;
@@ -5527,9 +5495,6 @@ async function prefetchCopyStatements() {
 
 const sqlOneLiner = computed(() => props.sql?.replace(/\s+/g, " ").trim() || "");
 
-type TableInfoTabItem = { id: TableInfoTab; label: string; icon: Component; count?: number };
-
-const TABLE_INFO_DRAWER_MIN_WIDTH = 240;
 const CELL_DETAIL_PANEL_MIN_HEIGHT = 180;
 const CELL_DETAIL_PANEL_MIN_WIDTH = 260;
 const CELL_DETAIL_PANEL_MAX_HEIGHT = 520;
@@ -5539,48 +5504,15 @@ function clampCellDetailPanelSize(value: number, layout = cellDetailPanelLayout.
   const max = layout === "bottom" ? CELL_DETAIL_PANEL_MAX_HEIGHT : DRAWER_MAX_WIDTH;
   return Math.min(Math.max(value, min), max);
 }
-const showTableInfo = globalDdlOpen;
-const activeTableInfoTab = ref<TableInfoTab>("columns");
-const ddlContent = ref("");
-const ddlLoading = ref(false);
-const ddlWidth = ref(settingsStore.editorSettings.tableInfoDrawerWidth);
 const detailPanelHeight = ref(settingsStore.editorSettings.cellDetailDrawerWidth);
-const ddlWrap = ref(true);
-const isResizingDdl = ref(false);
-let ddlResizeStartX = 0;
-let ddlResizeStartWidth = 0;
 let detailResizeStartY = 0;
 let detailResizeStartHeight = 0;
-const indexes = ref<IndexInfo[]>([]);
-const indexesLoaded = ref(false);
-const indexesLoading = ref(false);
-const indexesError = ref("");
-const foreignKeys = ref<ForeignKeyInfo[]>([]);
-const foreignKeysLoaded = ref(false);
-const foreignKeysLoading = ref(false);
-const foreignKeysError = ref("");
-const triggers = ref<TriggerInfo[]>([]);
-const triggersLoaded = ref(false);
-const triggersLoading = ref(false);
-const triggersError = ref("");
-const searchQuery = ref("");
 const cellDetailPanelLayout = computed(() => settingsStore.editorSettings.cellDetailPanelLayout);
 const cellDetailPanelIsBottom = computed(() => cellDetailPanelLayout.value === "bottom");
 
-watch([showCellDetail, showTableInfo], () => {
+watch(showCellDetail, () => {
   if (useCanvasGridRows.value) nextTick(syncCanvasViewport);
 });
-
-watch(activeTableInfoTab, () => {
-  searchQuery.value = "";
-});
-
-watch(
-  () => settingsStore.editorSettings.tableInfoDrawerWidth,
-  (width) => {
-    if (!isResizingDdl.value) ddlWidth.value = width;
-  },
-);
 
 watch(
   () => settingsStore.editorSettings.cellDetailDrawerWidth,
@@ -5592,10 +5524,6 @@ watch(
 watch(cellDetailPanelLayout, (layout) => {
   if (!isResizingDetail.value) detailPanelHeight.value = clampCellDetailPanelSize(detailPanelHeight.value, layout);
 });
-
-const ddlDrawerStyle = computed(() => ({
-  width: `${ddlWidth.value}px`,
-}));
 
 const detailPanelStyle = computed(() => (cellDetailPanelIsBottom.value ? { height: `${detailPanelHeight.value}px`, maxHeight: `min(70vh, ${CELL_DETAIL_PANEL_MAX_HEIGHT}px)` } : { width: `${detailPanelHeight.value}px` }));
 
@@ -5619,151 +5547,6 @@ function toggleCellDetailPanelLayout() {
     ...(nextLayout === "right" ? { cellDetailDrawerWidth: nextSize } : {}),
     cellDetailPanelLayout: nextLayout,
   });
-}
-
-const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(props.databaseType));
-const tableInfoTabs = computed(() => {
-  const tabs: TableInfoTabItem[] = [];
-  if (tableMetadataCapabilities.value.columns) {
-    tabs.push({
-      id: "columns",
-      label: t("grid.tableInfoColumns"),
-      icon: ListTree,
-      count: props.tableMeta?.columns.length,
-    });
-  }
-  if (tableMetadataCapabilities.value.indexes) {
-    tabs.push({ id: "indexes", label: t("grid.tableInfoIndexes"), icon: KeyRound, count: indexes.value.length });
-  }
-  if (tableMetadataCapabilities.value.foreignKeys) {
-    tabs.push({
-      id: "foreignKeys",
-      label: t("grid.tableInfoForeignKeys"),
-      icon: Link2,
-      count: foreignKeys.value.length,
-    });
-  }
-  if (tableMetadataCapabilities.value.triggers) {
-    tabs.push({ id: "triggers", label: t("grid.tableInfoTriggers"), icon: RotateCcw, count: triggers.value.length });
-  }
-  if (tableMetadataCapabilities.value.ddl) {
-    tabs.push({ id: "ddl", label: "DDL", icon: Code2 });
-  }
-  return tabs;
-});
-const tableInfoTabListStyle = computed(() => ({
-  gridTemplateColumns: `repeat(${tableInfoTabs.value.length}, minmax(0, 1fr))`,
-}));
-
-async function toggleTableInfo(tab: TableInfoTab = activeTableInfoTab.value) {
-  if (showTableInfo.value && activeTableInfoTab.value === tab) {
-    showTableInfo.value = false;
-    return;
-  }
-  showTableInfo.value = true;
-  await selectTableInfoTab(tab);
-}
-
-async function selectTableInfoTab(tab: TableInfoTab) {
-  const nextTab = tableInfoTabs.value.some((item) => item.id === tab) ? tab : tableInfoTabs.value[0]?.id;
-  if (!nextTab) return;
-  activeTableInfoTab.value = nextTab;
-  if (nextTab === "ddl") await fetchDdl();
-  else if (nextTab === "indexes") await fetchIndexes();
-  else if (nextTab === "foreignKeys") await fetchForeignKeys();
-  else if (nextTab === "triggers") await fetchTriggers();
-}
-
-watch(
-  () => [props.tableInfoTab, props.connectionId, props.database, props.tableMeta?.schema, props.tableMeta?.tableName] as const,
-  ([tab]) => {
-    if (tab) void selectTableInfoTab(tab);
-  },
-  { immediate: true },
-);
-
-async function fetchDdl() {
-  if (!props.connectionId || !props.tableMeta) return;
-  showTableInfo.value = true;
-  ddlLoading.value = true;
-  try {
-    ddlContent.value = await api.getTableDdl(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
-  } catch (e: any) {
-    ddlContent.value = `-- Error: ${e}`;
-  } finally {
-    ddlLoading.value = false;
-  }
-}
-
-async function fetchIndexes() {
-  if (!props.connectionId || !props.tableMeta || indexesLoaded.value || indexesLoading.value) return;
-  indexesLoading.value = true;
-  indexesError.value = "";
-  try {
-    indexes.value = await api.listIndexes(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
-    indexesLoaded.value = true;
-  } catch (e: any) {
-    indexesError.value = String(e?.message || e);
-  } finally {
-    indexesLoading.value = false;
-  }
-}
-
-async function fetchForeignKeys() {
-  if (!props.connectionId || !props.tableMeta || foreignKeysLoaded.value || foreignKeysLoading.value) return;
-  foreignKeysLoading.value = true;
-  foreignKeysError.value = "";
-  try {
-    foreignKeys.value = await api.listForeignKeys(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
-    foreignKeysLoaded.value = true;
-  } catch (e: any) {
-    foreignKeysError.value = String(e?.message || e);
-  } finally {
-    foreignKeysLoading.value = false;
-  }
-}
-
-async function fetchTriggers() {
-  if (!props.connectionId || !props.tableMeta || triggersLoaded.value || triggersLoading.value) return;
-  triggersLoading.value = true;
-  triggersError.value = "";
-  try {
-    triggers.value = await api.listTriggers(props.connectionId, props.database || "", props.tableMeta.schema || props.database || "", props.tableMeta.tableName);
-    triggersLoaded.value = true;
-  } catch (e: any) {
-    triggersError.value = String(e?.message || e);
-  } finally {
-    triggersLoading.value = false;
-  }
-}
-
-watch(
-  () => [props.connectionId, props.database, props.tableMeta?.schema, props.tableMeta?.tableName],
-  () => {
-    ddlContent.value = "";
-    indexes.value = [];
-    indexesLoaded.value = false;
-    indexesError.value = "";
-    foreignKeys.value = [];
-    foreignKeysLoaded.value = false;
-    foreignKeysError.value = "";
-    triggers.value = [];
-    triggersLoaded.value = false;
-    triggersError.value = "";
-    if (showTableInfo.value) selectTableInfoTab(activeTableInfoTab.value);
-  },
-);
-
-if (showTableInfo.value && props.tableMeta && props.connectionId) {
-  selectTableInfoTab(activeTableInfoTab.value);
-}
-
-function copyDdl() {
-  copyText(ddlContent.value);
-}
-
-function toggleDdlWrap() {
-  ddlWrap.value = !ddlWrap.value;
 }
 
 function searchSplitContainerWidth(): number {
@@ -5806,31 +5589,6 @@ function onSearchSplitResizeEnd() {
 function resetSearchSplitWidth() {
   const containerWidth = searchSplitContainerWidth();
   searchSplitWhereWidth.value = containerWidth > 0 ? clampSearchSplitWidth({ containerWidth }) : null;
-}
-
-function onDdlResizeStart(event: MouseEvent) {
-  isResizingDdl.value = true;
-  ddlResizeStartX = event.clientX;
-  ddlResizeStartWidth = ddlWidth.value;
-  document.body.classList.add("select-none", "cursor-col-resize");
-  window.addEventListener("mousemove", onDdlResizeMove);
-  window.addEventListener("mouseup", onDdlResizeEnd);
-}
-
-function onDdlResizeMove(event: MouseEvent) {
-  if (!isResizingDdl.value) return;
-  const nextWidth = ddlResizeStartWidth + ddlResizeStartX - event.clientX;
-  ddlWidth.value = Math.min(Math.max(nextWidth, TABLE_INFO_DRAWER_MIN_WIDTH), DRAWER_MAX_WIDTH);
-}
-
-function onDdlResizeEnd() {
-  if (isResizingDdl.value) {
-    settingsStore.updateEditorSettings({ tableInfoDrawerWidth: ddlWidth.value });
-  }
-  isResizingDdl.value = false;
-  document.body.classList.remove("select-none", "cursor-col-resize");
-  window.removeEventListener("mousemove", onDdlResizeMove);
-  window.removeEventListener("mouseup", onDdlResizeEnd);
 }
 
 function onDetailResizeStart(event: MouseEvent) {
@@ -5910,49 +5668,11 @@ onDeactivated(stopLoadingElapsedTimer);
 onUnmounted(() => {
   cleanupFrames();
   onSearchSplitResizeEnd();
-  onDdlResizeEnd();
   onDetailResizeEnd();
   finishCellSelection();
   clearTimeout(highlightedColumnTimer);
   clearTimeout(_searchTimer);
   clearInterval(_loadingTimer);
-});
-
-const filteredColumns = computed(() => {
-  if (!searchQuery.value) return props.tableMeta?.columns ?? [];
-  const q = searchQuery.value.toLowerCase();
-  return (props.tableMeta?.columns ?? []).filter((c) => c.name.toLowerCase().includes(q) || c.data_type.toLowerCase().includes(q));
-});
-
-const filteredIndexes = computed(() => {
-  if (!searchQuery.value) return indexes.value;
-  const q = searchQuery.value.toLowerCase();
-  return indexes.value.filter((i) => i.name.toLowerCase().includes(q) || i.columns.some((c) => c.toLowerCase().includes(q)));
-});
-
-const filteredForeignKeys = computed(() => {
-  if (!searchQuery.value) return foreignKeys.value;
-  const q = searchQuery.value.toLowerCase();
-  return foreignKeys.value.filter((fk) => fk.name.toLowerCase().includes(q) || fk.column.toLowerCase().includes(q) || fk.ref_table.toLowerCase().includes(q) || fk.ref_column.toLowerCase().includes(q));
-});
-
-const filteredTriggers = computed(() => {
-  if (!searchQuery.value) return triggers.value;
-  const q = searchQuery.value.toLowerCase();
-  return triggers.value.filter((t) => t.name.toLowerCase().includes(q));
-});
-
-const filteredDdlContent = computed(() => {
-  if (!ddlContent.value) return "";
-  const html = highlight(ddlContent.value);
-  if (!searchQuery.value) return html;
-
-  const escaped = searchQuery.value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const regex = new RegExp(`(${escaped})`, "gi");
-  // Match only text between > and < (text nodes), then replace the search term within those spans
-  return html.replace(/>([^<]*)</g, (_, text) => {
-    return `>${text.replace(regex, "<mark>$1</mark>")}<`;
-  });
 });
 
 defineExpose({
@@ -5962,10 +5682,6 @@ defineExpose({
   onToolbarRefresh,
   onToolbarCommit,
   onToolbarRollback,
-  showDdl: showTableInfo,
-  toggleDdl: toggleTableInfo,
-  showTableInfo,
-  toggleTableInfo,
   multiRowTranspose,
   setMultiRowTranspose,
   toggleMultiRowTranspose,
@@ -6750,6 +6466,17 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     <div class="shrink-0" :style="{ width: `${transposeAfterSpacerWidth}px` }" />
                   </div>
                 </template>
+                <template #after>
+                  <div
+                    class="flex items-center px-4 text-[10px] text-muted-foreground"
+                    :style="{
+                      width: `${transposeTotalWidth}px`,
+                      height: `${DATA_GRID_BOTTOM_SPACER_HEIGHT}px`,
+                    }"
+                  >
+                    <!-- Blank area to prevent clicking scrollbar when clicking the last row -->
+                  </div>
+                </template>
               </RecycleScroller>
             </div>
             <template v-else>
@@ -7261,6 +6988,17 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     <div class="shrink-0" :style="{ width: `${horizontalColumnWindow.afterWidth}px` }" />
                   </div>
                 </template>
+                <template #after>
+                  <div
+                    class="flex items-center px-4 text-[10px] text-muted-foreground"
+                    :style="{
+                      width: 'var(--total-w)',
+                      height: `${DATA_GRID_BOTTOM_SPACER_HEIGHT}px`,
+                    }"
+                  >
+                    <!-- Blank area to prevent clicking scrollbar when clicking the last row -->
+                  </div>
+                </template>
               </RecycleScroller>
               <!-- Infinite scroll loading indicator for RecycleScroller -->
               <div v-if="infiniteScrollEnabled && infiniteScrollLoading && !loading" class="flex items-center justify-center py-2 text-xs text-muted-foreground">
@@ -7280,158 +7018,6 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 </div>
               </div>
             </template>
-          </div>
-          <!-- Table Info Drawer -->
-          <div v-if="showTableInfo" class="relative col-start-2 row-start-1 border-l flex flex-col bg-background min-w-0" :class="[{ 'row-span-2': cellDetailPanelIsBottom }, { 'ddl-drawer-resizing': isResizingDdl }]" :style="ddlDrawerStyle" @contextmenu="onDrawerContextMenu">
-            <div class="absolute left-0 top-0 bottom-0 z-20 w-1.5 -translate-x-1/2 cursor-col-resize hover:bg-primary/30" @mousedown.prevent="onDdlResizeStart" />
-            <div class="flex items-center gap-2 px-3 py-1.5 border-b shrink-0 bg-muted/20 h-9">
-              <TableProperties class="w-3.5 h-3.5 text-muted-foreground" />
-              <span class="text-xs font-medium flex-1 min-w-0 truncate">{{ tableMeta?.tableName }}</span>
-              <Button v-if="activeTableInfoTab === 'ddl'" variant="ghost" size="sm" class="h-6 px-2 text-xs" :title="t('grid.copyDdl')" :aria-label="t('grid.copyDdl')" @click="copyDdl">
-                <Copy class="w-3 h-3" />
-                <span>{{ t("grid.copyDdl") }}</span>
-              </Button>
-              <Button v-if="activeTableInfoTab === 'ddl'" variant="ghost" size="icon" class="h-6 w-6" :class="{ 'bg-accent': ddlWrap }" @click="toggleDdlWrap">
-                <WrapText class="w-3 h-3" />
-              </Button>
-              <Button variant="ghost" size="icon" class="h-5 w-5" @click="showTableInfo = false">
-                <X class="w-3 h-3" />
-              </Button>
-            </div>
-            <div class="grid border-b bg-background shrink-0" :style="tableInfoTabListStyle">
-              <button
-                v-for="tab in tableInfoTabs"
-                :key="tab.id"
-                class="h-9 min-w-0 px-1.5 text-[11px] text-muted-foreground border-b-2 border-transparent hover:bg-gray-200 dark:hover:bg-gray-800/50 hover:text-foreground"
-                :class="{ 'border-primary text-foreground bg-muted/40': activeTableInfoTab === tab.id }"
-                :title="tab.label"
-                @click="selectTableInfoTab(tab.id)"
-              >
-                <component :is="tab.icon" class="mx-auto h-3.5 w-3.5" />
-                <span class="block truncate">{{ tab.label }}</span>
-              </button>
-            </div>
-
-            <div class="px-2 py-1.5 border-b shrink-0 bg-background">
-              <div class="relative">
-                <Search class="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
-                <input v-model="searchQuery" :placeholder="t('grid.tableInfoSearch')" class="w-full h-7 pl-7 pr-6 text-xs bg-muted/50 rounded border border-border focus:outline-none focus:border-primary/50" @keydown.escape="searchQuery = ''" />
-                <button v-if="searchQuery" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" @click="searchQuery = ''">
-                  <X class="w-3 h-3" />
-                </button>
-              </div>
-            </div>
-
-            <div v-if="activeTableInfoTab === 'columns'" class="flex-1 min-h-0 overflow-auto">
-              <div v-if="searchQuery && filteredColumns.length === 0" class="p-6 text-center text-xs text-muted-foreground">
-                {{ t("grid.tableInfoNoResults") }}
-              </div>
-              <table v-else class="w-full text-xs">
-                <thead class="sticky top-0 bg-muted text-muted-foreground">
-                  <tr class="border-b">
-                    <th class="text-left text-nowrap font-medium px-3 py-2 w-8">#</th>
-                    <th class="text-left text-nowrap font-medium px-3 py-2">{{ t("grid.columnName") }}</th>
-                    <th class="text-left text-nowrap font-medium px-3 py-2">{{ t("grid.columnType") }}</th>
-                    <th class="text-left text-nowrap font-medium px-3 py-2">{{ t("grid.tableInfoNullable") }}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr
-                    v-for="(column, index) in filteredColumns"
-                    :key="column.name"
-                    class="border-b cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-800/30"
-                    role="button"
-                    tabindex="0"
-                    :title="column.name"
-                    @click="scrollToTableInfoColumn(column.name)"
-                    @keydown.enter.prevent="scrollToTableInfoColumn(column.name)"
-                    @keydown.space.prevent="scrollToTableInfoColumn(column.name)"
-                  >
-                    <td class="px-3 py-2 text-muted-foreground w-8">{{ index + 1 }}</td>
-                    <td class="px-3 py-2 font-medium">
-                      <span class="inline-flex items-center gap-1.5">
-                        <KeyRound v-if="column.is_primary_key" class="h-3 w-3 text-amber-500" />
-                        {{ column.name }}
-                      </span>
-                      <div v-if="column.comment" class="mt-0.5 text-[11px] text-muted-foreground truncate">
-                        {{ column.comment }}
-                      </div>
-                    </td>
-                    <td class="px-3 py-2 font-mono text-[11px] text-muted-foreground">{{ column.data_type }}</td>
-                    <td class="px-3 py-2">{{ column.is_nullable ? "YES" : "NO" }}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-
-            <div v-else-if="activeTableInfoTab === 'indexes'" class="flex-1 min-h-0 overflow-auto">
-              <div v-if="indexesLoading" class="h-full flex items-center justify-center">
-                <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
-              </div>
-              <div v-else-if="indexesError" class="p-3 text-xs text-destructive">{{ indexesError }}</div>
-              <div v-else-if="searchQuery && filteredIndexes.length === 0" class="p-6 text-center text-xs text-muted-foreground">
-                {{ t("grid.tableInfoNoResults") }}
-              </div>
-              <div v-else-if="indexes.length === 0" class="p-6 text-center text-xs text-muted-foreground">
-                {{ t("grid.tableInfoEmpty") }}
-              </div>
-              <div v-else class="divide-y">
-                <div v-for="index in filteredIndexes" :key="index.name" class="p-3 text-xs">
-                  <div class="font-medium truncate">{{ index.name }}</div>
-                  <div class="mt-1 flex flex-wrap gap-1">
-                    <span v-if="index.is_primary" class="rounded bg-amber-500/10 px-1.5 py-0.5 text-amber-600">PK</span>
-                    <span v-if="index.is_unique" class="rounded bg-emerald-500/10 px-1.5 py-0.5 text-emerald-600">UNIQUE</span>
-                    <span v-if="index.index_type" class="rounded bg-muted px-1.5 py-0.5 text-muted-foreground">{{ index.index_type }}</span>
-                  </div>
-                  <div class="mt-2 font-mono text-[11px] text-muted-foreground break-all">
-                    {{ index.columns.join(", ") }}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div v-else-if="activeTableInfoTab === 'foreignKeys'" class="flex-1 min-h-0 overflow-auto">
-              <div v-if="foreignKeysLoading" class="h-full flex items-center justify-center">
-                <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
-              </div>
-              <div v-else-if="foreignKeysError" class="p-3 text-xs text-destructive">{{ foreignKeysError }}</div>
-              <div v-else-if="searchQuery && filteredForeignKeys.length === 0" class="p-6 text-center text-xs text-muted-foreground">
-                {{ t("grid.tableInfoNoResults") }}
-              </div>
-              <div v-else-if="foreignKeys.length === 0" class="p-6 text-center text-xs text-muted-foreground">
-                {{ t("grid.tableInfoEmpty") }}
-              </div>
-              <div v-else class="divide-y">
-                <div v-for="fk in filteredForeignKeys" :key="`${fk.name}:${fk.column}`" class="p-3 text-xs">
-                  <div class="font-medium truncate">{{ fk.name }}</div>
-                  <div class="mt-1 font-mono text-[11px] text-muted-foreground break-all">{{ fk.column }} -> {{ fk.ref_table }}.{{ fk.ref_column }}</div>
-                </div>
-              </div>
-            </div>
-
-            <div v-else-if="activeTableInfoTab === 'triggers'" class="flex-1 min-h-0 overflow-auto">
-              <div v-if="triggersLoading" class="h-full flex items-center justify-center">
-                <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
-              </div>
-              <div v-else-if="triggersError" class="p-3 text-xs text-destructive">{{ triggersError }}</div>
-              <div v-else-if="searchQuery && filteredTriggers.length === 0" class="p-6 text-center text-xs text-muted-foreground">
-                {{ t("grid.tableInfoNoResults") }}
-              </div>
-              <div v-else-if="triggers.length === 0" class="p-6 text-center text-xs text-muted-foreground">
-                {{ t("grid.tableInfoEmpty") }}
-              </div>
-              <div v-else class="divide-y">
-                <div v-for="trigger in filteredTriggers" :key="trigger.name" class="p-3 text-xs">
-                  <div class="font-medium truncate">{{ trigger.name }}</div>
-                  <div class="mt-1 text-[11px] text-muted-foreground">{{ trigger.timing }} {{ trigger.event }}</div>
-                </div>
-              </div>
-            </div>
-
-            <pre v-else-if="activeTableInfoTab === 'ddl' && !ddlLoading" data-native-clipboard class="flex-1 min-w-0 text-xs font-mono p-3 overflow-auto ddl-code leading-5 select-text" :class="ddlWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'" v-html="filteredDdlContent"></pre>
-            <div v-else class="flex-1 flex items-center justify-center">
-              <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
-            </div>
           </div>
           <!-- Cell Detail Drawer -->
           <div
@@ -8266,10 +7852,6 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   pointer-events: none;
 }
 
-.ddl-drawer-resizing {
-  transition: none;
-}
-
 .detail-drawer-resizing {
   transition: none;
 }
@@ -8321,21 +7903,5 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 
 .cell-selected {
   @apply outline outline-primary -outline-offset-1;
-}
-
-.ddl-code :deep(.ddl-kw) {
-  color: rgb(39 132 213);
-  color: oklch(0.6 0.15 250);
-  font-weight: 600;
-}
-
-.ddl-code :deep(.ddl-ident) {
-  color: rgb(58 168 91);
-  color: oklch(0.65 0.15 150);
-}
-
-.ddl-code :deep(.ddl-str) {
-  color: rgb(213 111 44);
-  color: oklch(0.65 0.15 50);
 }
 </style>

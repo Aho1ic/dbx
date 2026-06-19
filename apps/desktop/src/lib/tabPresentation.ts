@@ -91,6 +91,12 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
     if (compact) return t("tabs.users");
     return `${t("tabs.users")}@${connectionDisplayName(tab.connectionId)}`;
   }
+  if (tab.mode === "tableInfo" && tab.tableInfoTarget?.tableName) {
+    if (compact) return tab.tableInfoTarget.tableName;
+    const schema = tab.tableInfoTarget.schema;
+    const suffix = schema && schema !== tab.database ? `@${database}.${schema}` : `@${database}`;
+    return `${tab.tableInfoTarget.tableName}${suffix}`;
+  }
   return tab.title;
 }
 

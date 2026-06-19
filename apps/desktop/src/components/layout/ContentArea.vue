@@ -41,6 +41,7 @@ const MqAdminConsole = defineAsyncComponent(() => import("@/components/mq/MqAdmi
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
 const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseUserAdmin.vue"));
+const TableInfoView = defineAsyncComponent(() => import("@/components/grid/TableInfoView.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
 import { useQueryStore } from "@/stores/queryStore";
@@ -57,7 +58,7 @@ import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { chartableColumnIndexes } from "@/lib/chartData";
 import type { SqlExecutionOverride } from "@/lib/sqlExecutionTarget";
 import { useTabScroll } from "@/composables/useTabScroll";
-import type { QueryTab, ConnectionConfig, TableInfoTab } from "@/types/database";
+import type { QueryTab, ConnectionConfig } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 
 type DataGridHandle = {
@@ -76,8 +77,6 @@ type DataGridHandle = {
   allNullColumnCount: number;
   canToggleAllNullColumns: boolean;
   toggleAllNullColumns: () => void;
-  showDdl: boolean;
-  toggleDdl: (tab?: TableInfoTab) => void;
   multiRowTranspose: boolean;
   setMultiRowTranspose: (value: boolean) => void;
   exportCsv: () => Promise<void>;
@@ -441,6 +440,12 @@ function onHandleClickTable(tableName: string) {
 
 function onHandleViewTableData(tableName: string) {
   emit("viewTableData", tableName);
+}
+
+function openTableInfoTab() {
+  const tab = props.activeTab;
+  if (!tab.tableMeta || !tab.connectionId) return;
+  queryStore.openTableInfo(tab.connectionId, tab.database, tab.tableMeta.schema, tab.tableMeta.tableName, tab.tableMeta.columns, tab.tableMeta.primaryKeys);
 }
 
 function onHandleCloseColumnPanel() {
@@ -857,7 +862,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
               </div>
             </PopoverContent>
           </Popover>
-          <Button v-if="activeTab.tableMeta && activeTab.connectionId" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :class="{ 'bg-accent': dataGridRef?.showDdl }" @click="dataGridRef?.toggleDdl()"><TableProperties class="h-3.5 w-3.5" />{{ t("grid.tableInfo") }}</Button>
+          <Button v-if="activeTab.tableMeta && activeTab.connectionId" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" @click="openTableInfoTab()"> <TableProperties class="h-3.5 w-3.5" /> {{ t("grid.tableInfo") }} </Button>
           <DropdownMenu v-if="activeTab.tableMeta && activeTab.connectionId">
             <DropdownMenuTrigger as-child>
               <Button variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :title="t('tableToolbox.title')"><Toolbox class="h-3.5 w-3.5" />{{ t("tableToolbox.title") }}</Button>
@@ -1042,6 +1047,11 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
 
     <template v-else-if="activeTab.mode === 'users' && activeConnection">
       <DatabaseUserAdmin :key="activeTab.id" :connection="activeConnection" />
+    </template>
+
+    <!-- TableInfo mode: standalone table info viewer -->
+    <template v-else-if="activeTab.mode === 'tableInfo'">
+      <TableInfoView :key="activeTab.id" :tab="activeTab" />
     </template>
   </div>
 </template>

@@ -588,6 +588,34 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openTableInfo(connectionId: string, database: string, schema: string | undefined, tableName: string, columns: NonNullable<QueryTab["tableInfoTarget"]>["columns"], primaryKeys: string[]) {
+    const existing = tabs.value.find((tab) => tab.mode === "tableInfo" && tab.connectionId === connectionId && tab.database === database && (tab.tableInfoTarget?.schema || "") === (schema || "") && tab.tableInfoTarget?.tableName === tableName);
+    if (existing) {
+      existing.tableInfoTarget = { schema, tableName, columns, primaryKeys };
+      activeTabId.value = existing.id;
+      return existing.id;
+    }
+
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: t("grid.tableInfoTabTitle", { tableName }),
+      connectionId,
+      database,
+      schema,
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "tableInfo",
+      tableInfoTarget: { schema, tableName, columns, primaryKeys },
+      tableInfoActiveTab: "columns",
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string) {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
@@ -2087,6 +2115,7 @@ export const useQueryStore = defineStore("query", () => {
     openUserAdmin,
     openMqAdmin,
     openTableStructure,
+    openTableInfo,
     linkSavedSql,
     openSavedSql,
     togglePinnedTab,

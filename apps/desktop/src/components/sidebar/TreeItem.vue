@@ -2599,6 +2599,20 @@ function openStructureEditor() {
   queryStore.openTableStructure(node.connectionId, node.database, node.schema, node.label);
 }
 
+async function openTableInfoTab() {
+  const node = props.node;
+  if ((node.type !== "table" && node.type !== "view") || !node.connectionId || !node.database) return;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const querySchema = node.schema || node.database;
+    const columns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
+    const primaryKeys = columns.filter((c) => c.is_primary_key).map((c) => c.name);
+    queryStore.openTableInfo(node.connectionId, node.database, node.schema, node.label, columns, primaryKeys);
+  } catch (e: any) {
+    toast(e?.message || String(e), 5000);
+  }
+}
+
 function openFieldLineage() {
   const node = props.node;
   const column = node.type === "column" && node.meta && "name" in node.meta ? node.meta.name : node.label;
@@ -3283,6 +3297,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
     if (canOpenStructureEditor.value) {
       items.push({ label: t("contextMenu.editStructure"), action: openStructureEditor, icon: PencilRuler });
     }
+    items.push({ label: t("grid.tableInfo"), action: openTableInfoTab, icon: TableProperties });
     if (canRenameObject.value) {
       items.push({
         label: t("contextMenu.renameObject"),
