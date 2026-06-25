@@ -729,7 +729,7 @@
         "fieldLineage": true,
         "sqlExplain": false,
         "userAdmin": true,
-        "driverManagement": true
+        "driverManagement": false
       }
     },
     {
@@ -997,7 +997,7 @@
         "fieldLineage": true,
         "sqlExplain": false,
         "userAdmin": true,
-        "driverManagement": true
+        "driverManagement": false
       }
     },
     {
