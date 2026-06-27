@@ -1,11 +1,14 @@
-﻿import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
   DatabaseInfo,
+  SchemaInfo,
   LinkedServerInfo,
   TableInfo,
   ObjectInfo,
+  CompletionAssistantRequest,
+  CompletionAssistantResponse,
   ObjectStatistics,
   ObjectSource,
   ObjectSourceKind,
@@ -28,6 +31,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
+import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { QueryEditability } from "@/lib/sqlAnalysis";
@@ -126,6 +130,8 @@ export interface DriverRuntimeSummary {
 export interface DesktopSettings {
   show_tray_icon: boolean;
   icon_theme: "default" | "black";
+  quit_on_close: boolean;
+  close_action_prompted: boolean;
   debug_logging_enabled: boolean;
   saved_sql_sync_dir?: string | null;
   driver_store_dir?: string | null;
@@ -185,6 +191,7 @@ export interface QueryPaginationExecutionPlanOptions {
   databaseType?: DatabaseType;
   pagination: QueryPagination;
   useAgentCursor: boolean;
+  firstPageUsesActualSql?: boolean;
 }
 
 export interface QueryPaginationExecutionPlan {
@@ -245,10 +252,17 @@ export interface AiMessage {
   content: string;
 }
 
+export interface AiTaskContract {
+  action?: string;
+  mode?: string;
+  userRequest?: string;
+}
+
 export interface AiCompletionRequest {
   config: AiConfig;
   systemPrompt: string;
   messages: AiMessage[];
+  taskContract?: AiTaskContract;
   maxTokens?: number;
   temperature?: number;
 }
@@ -342,6 +356,8 @@ export interface DriverStoreMigrationResult {
   driver_store_dir: string | null;
   plugin_store_dir: string | null;
   agent_store_dir: string | null;
+  plugins_dir: string;
+  agents_dir: string;
   migrated_plugins: boolean;
   migrated_agents: boolean;
 }
@@ -422,6 +438,10 @@ export async function readExternalSqlFile(path: string): Promise<string> {
   return invoke("read_external_sql_file", { path });
 }
 
+export async function writeExternalSqlFile(path: string, content: string): Promise<void> {
+  return invoke("write_external_sql_file", { path, content });
+}
+
 // --- AI Conversations ---
 
 export interface AiChatMessage {
@@ -469,6 +489,10 @@ export async function disconnectDb(connectionId: string): Promise<void> {
   return invoke("disconnect_db", { connectionId });
 }
 
+export async function checkConnectionHealth(connectionId: string): Promise<void> {
+  return invoke("check_connection_health", { connectionId });
+}
+
 export async function closeDatabaseConnection(connectionId: string, database: string): Promise<boolean> {
   return invoke("close_database_connection", { connectionId, database });
 }
@@ -509,6 +533,10 @@ export async function listTables(connectionId: string, database: string, schema:
   return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes });
 }
 
+export async function getTableComment(connectionId: string, database: string, schema: string, table: string): Promise<string | null> {
+  return invoke("get_table_comment", { connectionId, database, schema, table });
+}
+
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
   return invoke("list_objects", { connectionId, database, schema, objectTypes });
 }
@@ -521,16 +549,28 @@ export async function listCompletionObjects(connectionId: string, database: stri
   return invoke("list_completion_objects", { connectionId, database, schema });
 }
 
+export async function completionAssistantSearch(request: CompletionAssistantRequest): Promise<CompletionAssistantResponse> {
+  return invoke("completion_assistant_search", { request });
+}
+
 export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind): Promise<ObjectSource> {
   return invoke("get_object_source", { connectionId, database, schema, name, objectType });
 }
 
-export async function listSchemas(connectionId: string, database: string): Promise<string[]> {
-  return invoke("list_schemas", { connectionId, database });
+export async function listSchemas(connectionId: string, database: string, applyVisibleFilter = false): Promise<string[]> {
+  return invoke("list_schemas", { connectionId, database, applyVisibleFilter });
+}
+
+export async function listSchemaInfos(connectionId: string, database: string): Promise<SchemaInfo[]> {
+  return invoke("list_schema_infos", { connectionId, database });
 }
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
   return invoke("get_columns", { connectionId, database, schema, table });
+}
+
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return invoke("list_data_types", { connectionId, database });
 }
 
 export async function executeQuery(
@@ -891,6 +931,10 @@ export async function installJdbcDriverFromMaven(coordinate: string, repositorie
   return invoke("install_jdbc_driver_from_maven", { request: { coordinate, repositories } });
 }
 
+export async function installPrestoSqlJdbcDriver(): Promise<JdbcDriverInfo[]> {
+  return invoke("install_prestosql_jdbc_driver");
+}
+
 export async function deleteJdbcDriver(path: string): Promise<JdbcDriverInfo[]> {
   return invoke("delete_jdbc_driver", { path });
 }
@@ -1000,6 +1044,10 @@ export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return invoke("load_saved_sql_library");
 }
 
+export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
+  return invoke("load_saved_sql_file", { id });
+}
+
 export async function saveSavedSqlFolder(folder: SavedSqlFolder): Promise<SavedSqlFolder> {
   return invoke("save_saved_sql_folder", { folder });
 }
@@ -1028,6 +1076,10 @@ export async function revealPathInFileManager(path: string): Promise<void> {
   return invoke("reveal_path_in_file_manager", { path });
 }
 
+export async function isSqliteDatabaseFile(path: string): Promise<boolean> {
+  return invoke("is_sqlite_database_file", { path });
+}
+
 export async function backupSqliteDatabase(connectionId: string, destinationPath: string): Promise<void> {
   return invoke("backup_sqlite_database", { connectionId, destinationPath });
 }
@@ -1053,6 +1105,13 @@ export interface UpdateInfo {
   release_name: string;
   release_url: string;
   release_notes: string;
+}
+
+export type UpdateDownloadSource = "official" | "cnb";
+
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null;
 }
 
 export interface McpServerStatus {
@@ -1084,6 +1143,10 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
 }
 
+export async function downloadAndInstallUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
+  return invoke("download_and_install_update", { source, latestVersion });
+}
+
 export async function getAppVersion(): Promise<string> {
   const { getVersion } = await import("@tauri-apps/api/app");
   return getVersion();
@@ -1093,10 +1156,10 @@ export async function getAppVersion(): Promise<string> {
 export interface RedisKeyInfo {
   key_display: string;
   key_raw: string;
-  key_type: string;
-  ttl: number;
-  size: number;
-  value_preview: string;
+  key_type?: string;
+  ttl?: number;
+  size?: number;
+  value_preview?: string;
 }
 
 export interface RedisDatabaseInfo {
@@ -1129,6 +1192,20 @@ export interface RedisCommandResult {
   value: any;
 }
 
+export interface RedisSlowlogEntry {
+  id: number;
+  timestamp: number;
+  duration_micros: number;
+  command: string;
+  client_addr: string | null;
+  client_name: string | null;
+}
+
+export interface RedisNodeEndpoint {
+  host: string;
+  port: number;
+}
+
 export async function redisListDatabases(connectionId: string): Promise<RedisDatabaseInfo[]> {
   return invoke("redis_list_databases", { connectionId });
 }
@@ -1137,8 +1214,8 @@ export async function redisScanKeys(connectionId: string, db: number, cursor: nu
   return invoke("redis_scan_keys", { connectionId, db, cursor, pattern, count });
 }
 
-export async function redisScanKeysBatch(connectionId: string, db: number, cursor: number, pattern: string, count: number, maxIterations: number): Promise<RedisScanResult> {
-  return invoke("redis_scan_keys_batch", { connectionId, db, cursor, pattern, count, maxIterations });
+export async function redisScanKeysBatch(connectionId: string, db: number, cursor: number, pattern: string, count: number, maxIterations: number, includeTypes = true): Promise<RedisScanResult> {
+  return invoke("redis_scan_keys_batch", { connectionId, db, cursor, pattern, count, maxIterations, includeTypes });
 }
 
 export async function redisScanValues(connectionId: string, db: number, cursor: number, pattern: string, query: string, count: number, includeKeyMatches = false): Promise<RedisScanResult> {
@@ -1229,6 +1306,14 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   return invoke("redis_pubsub_publish", { connectionId, db, channel, message });
 }
 
+export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
+  return invoke("redis_slowlog_get", { connectionId, count, nodeHost, nodePort });
+}
+
+export async function redisClusterMasterNodes(connectionId: string): Promise<RedisNodeEndpoint[]> {
+  return invoke("redis_cluster_master_nodes", { connectionId });
+}
+
 // --- etcd ---
 export type KvValueEncoding = "utf8" | "base64";
 
@@ -1243,6 +1328,16 @@ export interface KvKeyMetadata {
   version?: number | null;
   lease?: number | null;
   valueSize?: number | null;
+  czxid?: number | null;
+  mzxid?: number | null;
+  pzxid?: number | null;
+  ctime?: number | null;
+  mtime?: number | null;
+  cversion?: number | null;
+  aversion?: number | null;
+  ephemeralOwner?: number | null;
+  dataLength?: number | null;
+  numChildren?: number | null;
 }
 
 export interface KvKeySummary extends KvKeyMetadata {
@@ -1255,6 +1350,10 @@ export interface KvListPrefixResponse {
   revision?: number | null;
 }
 
+export interface KvListPrefixOptions {
+  recursive?: boolean | null;
+}
+
 export interface KvGetResponse {
   found: boolean;
   key?: string | null;
@@ -1264,6 +1363,18 @@ export interface KvGetResponse {
 
 export interface KvPutResponse {
   revision?: number | null;
+  version?: number | null;
+  mtime?: number | null;
+  key?: string | null;
+  createdKey?: string | null;
+}
+
+export type KvWriteMode = "upsert" | "create" | "update";
+export type KvCreateMode = "persistent" | "ephemeral" | "persistent_sequential" | "ephemeral_sequential";
+
+export interface KvPutOptions {
+  writeMode?: KvWriteMode | null;
+  createMode?: KvCreateMode | null;
 }
 
 export interface KvDeleteResponse {
@@ -1287,6 +1398,23 @@ export async function etcdDelete(connectionId: string, key: string): Promise<KvD
   return invoke("etcd_delete", { connectionId, key });
 }
 
+// --- ZooKeeper ---
+export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null, options?: KvListPrefixOptions | null): Promise<KvListPrefixResponse> {
+  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation, recursive: options?.recursive ?? null });
+}
+
+export async function zookeeperGet(connectionId: string, key: string): Promise<KvGetResponse> {
+  return invoke("zookeeper_get", { connectionId, key });
+}
+
+export async function zookeeperPut(connectionId: string, key: string, value: KvValue, options?: KvPutOptions | null): Promise<KvPutResponse> {
+  return invoke("zookeeper_put", { connectionId, key, value, options: options ?? null });
+}
+
+export async function zookeeperDelete(connectionId: string, key: string): Promise<KvDeleteResponse> {
+  return invoke("zookeeper_delete", { connectionId, key });
+}
+
 // --- MongoDB ---
 export interface MongoDocumentResult {
   documents: any[];
@@ -1297,15 +1425,28 @@ export async function mongoListDatabases(connectionId: string): Promise<string[]
   return invoke("mongo_list_databases", { connectionId });
 }
 
-export async function mongoListCollections(connectionId: string, database: string): Promise<string[]> {
+export async function mongoListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
   return invoke("mongo_list_collections", { connectionId, database });
 }
 
-export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
-  return mongoListCollections(connectionId, "default");
+export async function mongoCreateDatabase(connectionId: string, database: string): Promise<void> {
+  return invoke("mongo_create_database", { connectionId, database });
 }
 
-export async function vectorListCollections(connectionId: string): Promise<string[]> {
+export async function mongoDropDatabase(connectionId: string, database: string): Promise<void> {
+  return invoke("mongo_drop_database", { connectionId, database });
+}
+
+export async function mongoDropCollection(connectionId: string, database: string, collection: string): Promise<void> {
+  return invoke("mongo_drop_collection", { connectionId, database, collection });
+}
+
+export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
+  const collections = await mongoListCollections(connectionId, "default");
+  return collections.map((c) => c.name);
+}
+
+export async function vectorListCollections(connectionId: string): Promise<CollectionInfo[]> {
   return mongoListCollections(connectionId, "default");
 }
 
@@ -1489,7 +1630,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
         unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
           if (event.payload.transferId !== request.transferId) return;
           onProgress(event.payload);
-          if (event.payload.status === "done" || event.payload.status === "cancelled") {
+          if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
             unlisten?.();
             resolve();
           }
@@ -1640,6 +1781,7 @@ export interface TableExportRequest {
   orderBy?: string;
   skipCount?: boolean;
   batchSize?: number;
+  rowLimit?: number | null;
 }
 
 export interface TableCsvExportOptions {
@@ -1660,6 +1802,26 @@ export interface TableExportProgress {
   totalRows: number | null;
   status: TableExportStatus;
   errorMessage?: string;
+}
+
+export interface QueryResultExportRequest {
+  exportId: string;
+  connectionId: string;
+  database: string;
+  schema?: string;
+  sql: string;
+  queryBaseSql: string;
+  databaseType: DatabaseType;
+  useAgentCursor: boolean;
+  filePath: string;
+  format: "csv" | "xlsx";
+  pageSize: number;
+  rowLimit?: number | null;
+  totalRows?: number | null;
+  timeoutSecs?: number;
+  keysetOptimizationEnabled: boolean;
+  clientSessionId?: string;
+  executionId?: string;
 }
 
 export async function startTableExport(request: TableExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
@@ -1705,6 +1867,51 @@ export async function startTableExport(request: TableExportRequest, onProgress: 
 
 export async function cancelTableExport(exportId: string): Promise<void> {
   return invoke("cancel_table_export", { exportId });
+}
+
+export async function startQueryResultExport(request: QueryResultExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
+  let unlisten: UnlistenFn | undefined;
+  let settled = false;
+  let resolveTerminal: (progress: TableExportProgress) => void = () => {};
+  let rejectTerminal: (error: unknown) => void = () => {};
+
+  const terminalProgress = new Promise<TableExportProgress>((resolve, reject) => {
+    resolveTerminal = resolve;
+    rejectTerminal = reject;
+  });
+
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    unlisten?.();
+    callback();
+  };
+
+  try {
+    unlisten = await listen<TableExportProgress>("query-result-export-progress", (event) => {
+      if (event.payload.exportId !== request.exportId) return;
+      onProgress(event.payload);
+      if (event.payload.status === "Done" || event.payload.status === "Error" || event.payload.status === "Cancelled") {
+        if (event.payload.status === "Error") {
+          finish(() => rejectTerminal(new Error(event.payload.errorMessage || "Export failed")));
+        } else {
+          finish(() => resolveTerminal(event.payload));
+        }
+      }
+    });
+    await invoke("start_query_result_export", { request });
+    return await terminalProgress;
+  } catch (error) {
+    if (!settled) {
+      settled = true;
+      unlisten?.();
+    }
+    throw error;
+  }
+}
+
+export async function cancelQueryResultExport(exportId: string, executionId?: string): Promise<void> {
+  return invoke("cancel_query_result_export", { exportId, executionId: executionId || null });
 }
 
 export async function exportDatabaseSql(request: DatabaseExportRequest, onProgress: (progress: ExportProgress) => void): Promise<void> {
@@ -1783,3 +1990,4 @@ export async function exportQueryResultMarkdown(filePath: string, columns: strin
 }
 
 export * from "./mq-tauri";
+export * from "./nacos-tauri";

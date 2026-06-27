@@ -17,6 +17,13 @@ export interface SelectionData {
   rows: GridCellValue[][];
 }
 
+export interface SelectionSummary {
+  cellCount: number;
+  rowCount: number;
+  numericCount: number;
+  sum: number;
+}
+
 export function parseClipboardTable(text: string): string[][] {
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n$/, "");
   if (!normalized) return [[""]];
@@ -85,6 +92,28 @@ export function extractColumnsSelection(columns: readonly string[], rows: readon
   };
 }
 
+export function summarizeSelection(selection: SelectionData): SelectionSummary {
+  let numericCount = 0;
+  let sum = 0;
+
+  for (const row of selection.rows) {
+    for (const value of row) {
+      const numericValue = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : Number.NaN;
+      if (Number.isFinite(numericValue)) {
+        numericCount += 1;
+        sum += numericValue;
+      }
+    }
+  }
+
+  return {
+    cellCount: selection.rows.reduce((count, row) => count + row.length, 0),
+    rowCount: selection.rows.length,
+    numericCount,
+    sum,
+  };
+}
+
 function displayValue(value: GridCellValue): string {
   if (value === null) return "NULL";
   if (typeof value === "boolean") return value ? "true" : "false";
@@ -104,8 +133,10 @@ function sqlValue(value: GridCellValue): string {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-export function formatSelectionAsTsv(selection: SelectionData): string {
-  return selection.rows.map((row) => row.map(displayValue).join("\t")).join("\n");
+export function formatSelectionAsTsv(selection: SelectionData, includeHeader = false): string {
+  const body = selection.rows.map((row) => row.map(displayValue).join("\t")).join("\n");
+  if (!includeHeader) return body;
+  return [selection.columns.join("\t"), body].filter(Boolean).join("\n");
 }
 
 export function formatSelectionAsCsv(selection: SelectionData): string {

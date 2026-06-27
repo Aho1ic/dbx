@@ -13,6 +13,8 @@ export type DatabaseType =
   | "elasticsearch"
   | "qdrant"
   | "milvus"
+  | "weaviate"
+  | "chromadb"
   | "doris"
   | "starrocks"
   | "manticoresearch"
@@ -40,6 +42,7 @@ export type DatabaseType =
   | "h2"
   | "snowflake"
   | "trino"
+  | "prestosql"
   | "hive"
   | "db2"
   | "informix"
@@ -52,16 +55,57 @@ export type DatabaseType =
   | "xugu"
   | "iotdb"
   | "etcd"
+  | "zookeeper"
   | "iris"
   | "influxdb"
   | "jdbc"
-  | "mq";
+  | "mq"
+  | "nacos";
 
 export interface SqlSnippet {
   id: string;
   label: string;
   prefix: string;
   body: string;
+}
+
+export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column";
+
+export type CompletionAssistantCandidateKind = "database" | "schema" | "table" | "view" | "procedure" | "function" | "column" | "object";
+
+export type CompletionAssistantMatchMode = "prefix" | "contains";
+
+export interface CompletionAssistantRequest {
+  connection_id: string;
+  database: string;
+  schema?: string | null;
+  object_kinds?: CompletionAssistantObjectKind[];
+  mask?: string;
+  case_sensitive?: boolean;
+  global_search?: boolean;
+  max_results?: number | null;
+  search_in_comments?: boolean;
+  search_in_definitions?: boolean;
+  parent_schema?: string | null;
+  parent_name?: string | null;
+  match_mode?: CompletionAssistantMatchMode | null;
+}
+
+export interface CompletionAssistantCandidate {
+  name: string;
+  kind: CompletionAssistantCandidateKind;
+  database?: string | null;
+  schema?: string | null;
+  parent_schema?: string | null;
+  parent_name?: string | null;
+  comment?: string | null;
+  data_type?: string | null;
+}
+
+export interface CompletionAssistantResponse {
+  candidates: CompletionAssistantCandidate[];
+  incomplete: boolean;
+  fallback_used: boolean;
 }
 
 export interface ConnectionConfig {
@@ -77,6 +121,7 @@ export interface ConnectionConfig {
   password: string;
   database?: string;
   visible_databases?: string[];
+  visible_schemas?: Record<string, string[]>;
   attached_databases?: AttachedDatabaseConfig[];
   color?: string;
   transport_layers?: TransportLayerConfig[];
@@ -101,6 +146,7 @@ export interface ConnectionConfig {
   redis_sentinel_tls?: boolean;
   redis_cluster_nodes?: string;
   redis_key_separator?: string;
+  redis_scan_page_size?: number;
   etcd_endpoints?: string;
   gbase_server?: string;
   informix_server?: string;
@@ -207,6 +253,11 @@ export interface JdbcPluginStatus {
 
 export interface DatabaseInfo {
   name: string;
+}
+
+export interface SchemaInfo {
+  name: string;
+  comment?: string | null;
 }
 
 export interface LinkedServerInfo {
@@ -360,6 +411,8 @@ export interface QueryResultRun {
   resultSortColumn?: string;
   resultSortColumnIndex?: number;
   resultSortDirection?: "asc" | "desc";
+  resultSortMode?: "database" | "local";
+  resultLocalSortOriginalRows?: QueryResult["rows"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -444,7 +497,9 @@ export type TreeNodeType =
   | "trigger"
   | "redis-db"
   | "mq-tenant"
+  | "nacos-namespace"
   | "etcd-root"
+  | "zookeeper-root"
   | "mongo-db"
   | "mongo-collection"
   | "vector-collection"
@@ -477,8 +532,11 @@ export interface TreeNode {
   linkedCatalog?: string;
   linkedSchema?: string;
   mqTenant?: string;
+  nacosNamespace?: string;
+  nacosNamespaceName?: string;
   schema?: string;
   tableName?: string;
+  tableType?: string;
   comment?: string | null;
   objectCount?: number;
   loadedKeyCount?: number;
@@ -488,7 +546,7 @@ export interface TreeNode {
   hiddenChildren?: TreeNode[];
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | VectorCollectionMeta;
   loadMore?: {
     parentId: string;
     offset: number;
@@ -507,6 +565,7 @@ export interface QueryTab {
   schema?: string;
   sql: string;
   savedSqlId?: string;
+  externalSqlPath?: string;
   originalSql?: string;
   lastExecutedSql?: string;
   resultBaseSql?: string;
@@ -514,6 +573,8 @@ export interface QueryTab {
   resultSortColumn?: string;
   resultSortColumnIndex?: number;
   resultSortDirection?: "asc" | "desc";
+  resultSortMode?: "database" | "local";
+  resultLocalSortOriginalRows?: QueryResult["rows"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -550,8 +611,10 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "vector" | "etcd" | "mq" | "objects" | "structure" | "users" | "tableInfo";
+  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "tableInfo";
   mqTenant?: string;
+  nacosNamespace?: string;
+  nacosNamespaceName?: string;
   structureTableName?: string;
   tableInfoTarget?: {
     schema?: string;
@@ -576,6 +639,7 @@ export interface QueryTab {
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
+  tableMetaUpdatedAt?: number;
   tableInfoTab?: TableInfoTab;
   queryAnalysis?: {
     schema?: string;
@@ -616,6 +680,7 @@ export interface SavedSqlFile {
   database: string;
   schema?: string;
   sql: string;
+  sqlLoaded?: boolean;
   orderIndex?: number;
   openCount?: number;
   openedAt?: string;
@@ -626,4 +691,14 @@ export interface SavedSqlFile {
 export interface SavedSqlLibrary {
   folders: SavedSqlFolder[];
   files: SavedSqlFile[];
+}
+
+export interface VectorCollectionMeta {
+  dimension?: number;
+}
+
+export interface CollectionInfo {
+  name: string;
+  id: string;
+  dimension?: number;
 }

@@ -268,6 +268,7 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
     "interval day to second",
   ],
   questdb: ["boolean", "ipv4", "byte", "short", "char", "int", "float", "symbol", "varchar", "string", "long", "date", "timestamp", "timestamp_ns", "double", "uuid", "binary", "long256", "geohash", "array", "interval", "decimal"],
+  xugu: ["BOOLEAN", "INTEGER", "SMALLINT", "BIGINT", "FLOAT", "NUMERIC", "CHAR", "VARCHAR", "CLOB", "DATE", "TIME", "TIMESTAMP", "BINARY", "VARBINARY", "BLOB", "XML", "BOOL", "INT", "SHORT", "LONGINT", "LONG", "REAL", "DECIMAL", "TEXT", "NCHAR", "NVARCHAR", "NVARCHAR2"],
 };
 
 const DATA_TYPE_OPTION_ALIASES: Partial<Record<DatabaseType, string>> = {
@@ -374,6 +375,53 @@ export const QUESTDB_TYPE_LENGTHS: Record<string, string> = {
 
 export const DEFAULT_TYPE_LENGTH_DISABLES: string[] = [];
 
+export const POSTGRES_TYPE_LENGTH_DISABLES: string[] = [
+  "bigint",
+  "int8",
+  "bigserial",
+  "serial8",
+  "boolean",
+  "bool",
+  "box",
+  "bytea",
+  "cidr",
+  "circle",
+  "date",
+  "double precision",
+  "float",
+  "float8",
+  "inet",
+  "integer",
+  "int",
+  "int4",
+  "json",
+  "jsonb",
+  "line",
+  "lseg",
+  "macaddr",
+  "macaddr8",
+  "money",
+  "path",
+  "pg_lsn",
+  "pg_snapshot",
+  "point",
+  "polygon",
+  "real",
+  "float4",
+  "smallint",
+  "int2",
+  "smallserial",
+  "serial2",
+  "serial",
+  "serial4",
+  "text",
+  "tsquery",
+  "tsvector",
+  "txid_snapshot",
+  "uuid",
+  "xml",
+];
+
 export function parseExtraToColumnExtra(extra: string | null | undefined, databaseType?: DatabaseType): ColumnExtra {
   const result: ColumnExtra = {};
   if (!extra) return result;
@@ -472,20 +520,40 @@ export function applyManticoreDdlColumnExtras(columns: ColumnInfo[], ddl: string
   });
 }
 
+function isPostgresTextualType(dataType: string): boolean {
+  const baseType = dataType.split("(")[0]?.trim().replace(/\s+/g, " ").toLowerCase() ?? "";
+  return ["char", "character", "varchar", "character varying", "text", "bpchar", "name", "json", "jsonb", "xml", "bytea", "uuid"].includes(baseType);
+}
+
+function stripPostgresStringDefaultCast(defaultValue: string, dataType: string): string {
+  if (!isPostgresTextualType(dataType)) return defaultValue;
+  const trimmed = defaultValue.trim();
+  const match = trimmed.match(/^('(?:''|[^'])*')::\s*((?:character\s+varying)|character|varchar|char|text|bpchar|name|jsonb?|xml|bytea|uuid)(?:\s*\(\s*\d+\s*\))?$/i);
+  return match?.[1] ?? defaultValue;
+}
+
+function columnDefaultForEditor(column: ColumnInfo, databaseType?: DatabaseType): string {
+  const defaultValue = column.column_default ?? "";
+  return databaseType === "postgres" ? stripPostgresStringDefaultCast(defaultValue, column.data_type) : defaultValue;
+}
+
 export function createColumnDrafts(columns: ColumnInfo[], databaseType?: DatabaseType): EditableStructureColumn[] {
-  return columns.map((column, index) => ({
-    id: `existing:${column.name}`,
-    name: column.name,
-    dataType: column.data_type,
-    isNullable: column.is_nullable,
-    defaultValue: column.column_default ?? "",
-    comment: column.comment ?? "",
-    isPrimaryKey: column.is_primary_key,
-    extra: parseExtraToColumnExtra(column.extra, databaseType),
-    original: column,
-    originalPosition: index,
-    markedForDrop: false,
-  }));
+  return columns.map((column, index) => {
+    const defaultValue = columnDefaultForEditor(column, databaseType);
+    return {
+      id: `existing:${column.name}`,
+      name: column.name,
+      dataType: column.data_type,
+      isNullable: column.is_nullable,
+      defaultValue,
+      comment: column.comment ?? "",
+      isPrimaryKey: column.is_primary_key,
+      extra: parseExtraToColumnExtra(column.extra, databaseType),
+      original: { ...column, column_default: column.column_default === null ? null : defaultValue },
+      originalPosition: index,
+      markedForDrop: false,
+    };
+  });
 }
 
 export function createIndexDrafts(indexes: IndexInfo[]): EditableStructureIndex[] {
@@ -596,8 +664,14 @@ export function splitDataType(raw: string): { baseType: string; params: string }
   const trimmed = raw.trim();
   const parenIdx = trimmed.indexOf("(");
   if (parenIdx === -1) return { baseType: trimmed, params: "" };
-  const baseType = trimmed.slice(0, parenIdx).trim();
-  const params = trimmed.slice(parenIdx + 1, trimmed.lastIndexOf(")")).trim();
+  const closeIdx = trimmed.lastIndexOf(")");
+  const baseTypePrefix = trimmed.slice(0, parenIdx).trim();
+  const params = trimmed.slice(parenIdx + 1, closeIdx).trim();
+  const suffix = trimmed
+    .slice(closeIdx + 1)
+    .trim()
+    .replace(/\s+/g, " ");
+  const baseType = /^(?:signed|unsigned|zerofill)(?:\s+(?:signed|unsigned|zerofill))*$/i.test(suffix) ? `${baseTypePrefix} ${suffix}`.trim() : baseTypePrefix;
   return { baseType, params };
 }
 
@@ -610,7 +684,13 @@ export function combineDataType(baseType: string, params: string): string {
 }
 
 export function combineDataTypeForDatabase(dbType: DatabaseType | undefined, baseType: string, params: string): string {
-  return combineDataType(baseType, normalizeDataTypeParams(dbType, baseType, params));
+  if (isDataTypeLengthDisabled(dbType, baseType)) {
+    return baseType;
+  }
+  const normalizedParams = normalizeDataTypeParams(dbType, baseType, params);
+  const mysqlType = combineMysqlNumericAttributeType(dbType, baseType, normalizedParams);
+  if (mysqlType) return mysqlType;
+  return combineDataType(baseType, normalizedParams);
 }
 
 export function normalizeDataTypeParams(dbType: DatabaseType | undefined, baseType: string, params: string): string {
@@ -651,6 +731,21 @@ function isTemporalPrecisionType(dbType: DatabaseType | undefined, baseType: str
   }
 }
 
+function combineMysqlNumericAttributeType(dbType: DatabaseType | undefined, baseType: string, params: string): string | null {
+  if (!params || !isMysqlLikeStructureType(dbType)) return null;
+  const parts = baseType.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+  const typeName = parts[0]?.toLowerCase();
+  if (!typeName || !["tinyint", "smallint", "mediumint", "int", "integer", "bigint", "real", "double", "float", "decimal", "numeric"].includes(typeName)) return null;
+  const attrIndex = parts.findIndex((part) => ["signed", "unsigned", "zerofill"].includes(part.toLowerCase()));
+  if (attrIndex === -1) return null;
+  if (!parts.slice(attrIndex).every((part) => ["signed", "unsigned", "zerofill"].includes(part.toLowerCase()))) return null;
+  return `${parts.slice(0, attrIndex).join(" ")}(${params}) ${parts.slice(attrIndex).join(" ")}`;
+}
+
+function isMysqlLikeStructureType(dbType: DatabaseType | undefined): boolean {
+  return dbType === "mysql" || dbType === "doris" || dbType === "starrocks" || dbType === "goldendb" || dbType === "sundb" || dbType === "databend";
+}
+
 function isValidTemporalPrecision(dbType: DatabaseType | undefined, params: string): boolean {
   if (!/^\d+$/.test(params)) return false;
   const value = Number(params);
@@ -673,6 +768,8 @@ export function isDataTypeLengthDisabled(_dbType: DatabaseType | undefined, base
     return key !== "geohash" && key !== "decimal";
   } else if (_dbType === "manticoresearch") {
     return key !== "bit" && key !== "float_vector";
+  } else if (_dbType === "postgres" || _dbType === "gaussdb" || _dbType === "kwdb" || _dbType === "opengauss" || _dbType === "highgo" || _dbType === "vastbase" || _dbType === "kingbase") {
+    return POSTGRES_TYPE_LENGTH_DISABLES.includes(key);
   } else {
     return DEFAULT_TYPE_LENGTH_DISABLES.includes(key);
   }

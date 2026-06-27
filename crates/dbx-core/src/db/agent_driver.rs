@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 const RPC_TIMEOUT_SECS: u64 = 30;
@@ -114,10 +115,13 @@ pub enum AgentMethod {
     Handshake,
     Connect,
     TestConnection,
+    ValidateConnection,
     ListDatabases,
     ListSchemas,
     ListTables,
     ListObjects,
+    ListDataTypes,
+    CompletionAssistantSearchV1,
     GetObjectSource,
     GetColumns,
     ListIndexes,
@@ -128,21 +132,28 @@ pub enum AgentMethod {
     ExecuteQueryPage,
     FetchQueryPage,
     CloseQuerySession,
+    StartTableRead,
+    FetchTableReadPage,
+    CloseTableReadSession,
     GetExplainInfo,
+    ExecuteBatch,
     ExecuteTransaction,
     Disconnect,
     Shutdown,
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 28] = [
         Self::Handshake,
         Self::Connect,
         Self::TestConnection,
+        Self::ValidateConnection,
         Self::ListDatabases,
         Self::ListSchemas,
         Self::ListTables,
         Self::ListObjects,
+        Self::ListDataTypes,
+        Self::CompletionAssistantSearchV1,
         Self::GetObjectSource,
         Self::GetTableDdl,
         Self::GetColumns,
@@ -153,7 +164,11 @@ impl AgentMethod {
         Self::ExecuteQueryPage,
         Self::FetchQueryPage,
         Self::CloseQuerySession,
+        Self::StartTableRead,
+        Self::FetchTableReadPage,
+        Self::CloseTableReadSession,
         Self::GetExplainInfo,
+        Self::ExecuteBatch,
         Self::ExecuteTransaction,
         Self::Disconnect,
         Self::Shutdown,
@@ -164,10 +179,13 @@ impl AgentMethod {
             Self::Handshake => "handshake",
             Self::Connect => "connect",
             Self::TestConnection => "test_connection",
+            Self::ValidateConnection => "validate_connection",
             Self::ListDatabases => "list_databases",
             Self::ListSchemas => "list_schemas",
             Self::ListTables => "list_tables",
             Self::ListObjects => "list_objects",
+            Self::ListDataTypes => "list_data_types",
+            Self::CompletionAssistantSearchV1 => "completion_assistant_search_v1",
             Self::GetObjectSource => "get_object_source",
             Self::GetTableDdl => "get_table_ddl",
             Self::GetColumns => "get_columns",
@@ -178,12 +196,43 @@ impl AgentMethod {
             Self::ExecuteQueryPage => "execute_query_page",
             Self::FetchQueryPage => "fetch_query_page",
             Self::CloseQuerySession => "close_query_session",
+            Self::StartTableRead => "start_table_read",
+            Self::FetchTableReadPage => "fetch_table_read_page",
+            Self::CloseTableReadSession => "close_table_read_session",
             Self::GetExplainInfo => "get_explain_info",
+            Self::ExecuteBatch => "execute_batch",
             Self::ExecuteTransaction => "execute_transaction",
             Self::Disconnect => "disconnect",
             Self::Shutdown => "shutdown",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadStartParams {
+    pub sql: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub page_size: usize,
+    pub max_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fetch_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadPageParams {
+    pub session_id: String,
+    pub page_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTableReadCloseParams {
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +420,19 @@ impl AgentDriverClient {
         params: Value,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.call_with_timeout_and_cancel(method, params, timeout_duration, None).await
+    }
+
+    /// Send a JSON-RPC 2.0 request and wait for the response.
+    /// If cancellation happens while a response is pending, kill the agent
+    /// process because the stdio stream cannot safely skip that response.
+    pub async fn call_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
         self.next_id += 1;
         let id = self.next_id;
 
@@ -427,15 +489,41 @@ impl AgentDriverClient {
 
             (reader, result)
         });
-        let (returned_reader, result) = match timeout_duration {
-            Some(duration) => match tokio::time::timeout(duration, response_task).await {
+        let (returned_reader, result) = match (timeout_duration, cancel_token) {
+            (Some(duration), Some(token)) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        self.kill();
+                        return Err("Query canceled".to_string());
+                    }
+                    result = tokio::time::timeout(duration, response_task) => match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            self.kill();
+                            return Err(format!("Agent RPC call timed out ({}s)", duration.as_secs()));
+                        }
+                    },
+                }
+            }
+            (Some(duration), None) => match tokio::time::timeout(duration, response_task).await {
                 Ok(result) => result,
                 Err(_) => {
                     self.kill();
                     return Err(format!("Agent RPC call timed out ({}s)", duration.as_secs()));
                 }
             },
-            None => response_task.await,
+            (None, Some(token)) => {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        self.kill();
+                        return Err("Query canceled".to_string());
+                    }
+                    result = response_task => result,
+                }
+            }
+            (None, None) => response_task.await,
         }
         .map_err(|e| format!("Agent RPC task failed: {e}"))?;
 
@@ -460,6 +548,16 @@ impl AgentDriverClient {
         self.call_with_timeout(method.as_str(), params, timeout_duration).await
     }
 
+    pub async fn call_method_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        method: AgentMethod,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
+        self.call_with_timeout_and_cancel(method.as_str(), params, timeout_duration, cancel_token).await
+    }
+
     pub async fn connect(&mut self, params: Value) -> Result<Value, String> {
         self.call_method(AgentMethod::Connect, params).await
     }
@@ -468,32 +566,99 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::TestConnection, params).await
     }
 
+    pub async fn validate_connection(&mut self, timeout_duration: Option<Duration>) -> Result<Value, String> {
+        self.call_method_with_timeout(AgentMethod::ValidateConnection, serde_json::json!({}), timeout_duration).await
+    }
+
     pub async fn disconnect(&mut self) -> Result<Value, String> {
         self.call_method(AgentMethod::Disconnect, serde_json::json!({})).await
     }
 
-    pub async fn list_databases<T: DeserializeOwned + Send + 'static>(&mut self) -> Result<T, String> {
-        self.call_method(AgentMethod::ListDatabases, serde_json::json!({})).await
+    pub async fn list_databases<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(AgentMethod::ListDatabases, serde_json::json!({}), timeout_duration).await
     }
 
-    pub async fn list_schemas<T: DeserializeOwned + Send + 'static>(&mut self, database: &str) -> Result<T, String> {
-        self.call_method(AgentMethod::ListSchemas, serde_json::json!({ "database": database })).await
+    pub async fn list_schemas<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.list_schemas_filtered(database, None, timeout_duration).await
+    }
+
+    pub async fn list_schemas_filtered<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        visible_schemas: Option<&[String]>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = serde_json::json!({ "database": database });
+        if let Some(visible_schemas) = visible_schemas {
+            params["visible_schemas"] = serde_json::json!(visible_schemas);
+        }
+        self.call_method_with_timeout(AgentMethod::ListSchemas, params, timeout_duration).await
     }
 
     pub async fn list_tables<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: &str,
         schema: &str,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::ListTables, agent_schema_params(database, schema)).await
+        self.list_tables_filtered(database, schema, None, timeout_duration).await
+    }
+
+    pub async fn list_tables_filtered<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        object_types: Option<&[String]>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params = agent_schema_params(database, schema);
+        if let Some(object_types) = object_types {
+            params["object_types"] = serde_json::json!(object_types);
+        }
+        self.call_method_with_timeout(AgentMethod::ListTables, params, timeout_duration).await
     }
 
     pub async fn list_objects<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: &str,
         schema: &str,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::ListObjects, agent_schema_params(database, schema)).await
+        self.call_method_with_timeout(AgentMethod::ListObjects, agent_schema_params(database, schema), timeout_duration)
+            .await
+    }
+
+    pub async fn list_data_types<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ListDataTypes,
+            serde_json::json!({ "database": database }),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn completion_assistant_search<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        request: &crate::types::CompletionAssistantRequest,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::CompletionAssistantSearchV1,
+            serde_json::to_value(request).map_err(|e| e.to_string())?,
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn get_object_source<T: DeserializeOwned + Send + 'static, K: Serialize>(
@@ -502,9 +667,14 @@ impl AgentDriverClient {
         schema: &str,
         name: &str,
         object_type: &K,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::GetObjectSource, agent_object_source_params(database, schema, name, object_type))
-            .await
+        self.call_method_with_timeout(
+            AgentMethod::GetObjectSource,
+            agent_object_source_params(database, schema, name, object_type),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn get_columns<T: DeserializeOwned + Send + 'static>(
@@ -512,8 +682,14 @@ impl AgentDriverClient {
         database: &str,
         schema: &str,
         table: &str,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::GetColumns, agent_schema_table_params(database, schema, table)).await
+        self.call_method_with_timeout(
+            AgentMethod::GetColumns,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn list_indexes<T: DeserializeOwned + Send + 'static>(
@@ -521,8 +697,14 @@ impl AgentDriverClient {
         database: &str,
         schema: &str,
         table: &str,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::ListIndexes, agent_schema_table_params(database, schema, table)).await
+        self.call_method_with_timeout(
+            AgentMethod::ListIndexes,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn list_foreign_keys<T: DeserializeOwned + Send + 'static>(
@@ -530,8 +712,14 @@ impl AgentDriverClient {
         database: &str,
         schema: &str,
         table: &str,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::ListForeignKeys, agent_schema_table_params(database, schema, table)).await
+        self.call_method_with_timeout(
+            AgentMethod::ListForeignKeys,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn list_triggers<T: DeserializeOwned + Send + 'static>(
@@ -539,8 +727,14 @@ impl AgentDriverClient {
         database: &str,
         schema: &str,
         table: &str,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::ListTriggers, agent_schema_table_params(database, schema, table)).await
+        self.call_method_with_timeout(
+            AgentMethod::ListTriggers,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn get_table_ddl<T: DeserializeOwned + Send + 'static>(
@@ -548,8 +742,14 @@ impl AgentDriverClient {
         database: &str,
         schema: &str,
         table: &str,
+        timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
-        self.call_method(AgentMethod::GetTableDdl, agent_schema_table_params(database, schema, table)).await
+        self.call_method_with_timeout(
+            AgentMethod::GetTableDdl,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn execute_query<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
@@ -562,6 +762,16 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
         self.call_method_with_timeout(AgentMethod::ExecuteQuery, params, timeout_duration).await
+    }
+
+    pub async fn execute_query_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout_and_cancel(AgentMethod::ExecuteQuery, params, timeout_duration, cancel_token)
+            .await
     }
 
     pub async fn execute_query_page<T: DeserializeOwned + Send + 'static>(
@@ -579,6 +789,16 @@ impl AgentDriverClient {
         self.call_method_with_timeout(AgentMethod::ExecuteQueryPage, params, timeout_duration).await
     }
 
+    pub async fn execute_query_page_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout_and_cancel(AgentMethod::ExecuteQueryPage, params, timeout_duration, cancel_token)
+            .await
+    }
+
     pub async fn fetch_query_page<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
         self.call_method(AgentMethod::FetchQueryPage, params).await
     }
@@ -589,6 +809,16 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
         self.call_method_with_timeout(AgentMethod::FetchQueryPage, params, timeout_duration).await
+    }
+
+    pub async fn fetch_query_page_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: Value,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout_and_cancel(AgentMethod::FetchQueryPage, params, timeout_duration, cancel_token)
+            .await
     }
 
     pub async fn get_explain_info<T: DeserializeOwned + Send + 'static>(&mut self, params: Value) -> Result<T, String> {
@@ -602,6 +832,38 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::CloseQuerySession, agent_close_query_session_params(session_id)).await
     }
 
+    pub async fn start_table_read<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: AgentTableReadStartParams,
+    ) -> Result<T, String> {
+        self.call_method(AgentMethod::StartTableRead, serde_json::to_value(params).map_err(|e| e.to_string())?).await
+    }
+
+    pub async fn fetch_table_read_page<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        session_id: &str,
+        page_size: usize,
+    ) -> Result<T, String> {
+        self.call_method(
+            AgentMethod::FetchTableReadPage,
+            serde_json::to_value(AgentTableReadPageParams { session_id: session_id.to_string(), page_size })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    pub async fn close_table_read_session<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        session_id: &str,
+    ) -> Result<T, String> {
+        self.call_method(
+            AgentMethod::CloseTableReadSession,
+            serde_json::to_value(AgentTableReadCloseParams { session_id: session_id.to_string() })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
     pub async fn execute_transaction<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: Option<&str>,
@@ -609,6 +871,21 @@ impl AgentDriverClient {
         schema: Option<&str>,
     ) -> Result<T, String> {
         self.call_method(AgentMethod::ExecuteTransaction, agent_transaction_params(database, statements, schema)).await
+    }
+
+    pub async fn execute_batch<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        statements: &[String],
+        schema: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::ExecuteBatch,
+            agent_transaction_params(database, statements, schema),
+            timeout_duration,
+        )
+        .await
     }
 
     pub async fn call_mongo_method<T: DeserializeOwned + Send + 'static>(
@@ -722,8 +999,24 @@ impl AgentDriverClient {
         if let Err(e) = self.child.kill() {
             log::warn!("Failed to kill agent process: {e}");
         }
-        // Reap the child to avoid zombie processes
-        let _ = self.child.wait();
+        // Reap the child to avoid zombie processes.
+        // Use try_wait() with a timeout instead of blocking wait() to avoid
+        // hanging in Drop during async cleanup. Poll up to 100ms for the
+        // process to exit after kill().
+        for _ in 0..10 {
+            match self.child.try_wait() {
+                Ok(Some(_status)) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    log::warn!("Failed to wait for agent process: {e}");
+                    return;
+                }
+            }
+        }
+        // Final blocking wait as a last resort
+        if let Err(e) = self.child.wait() {
+            log::warn!("Final wait failed for agent process: {e}");
+        }
     }
 
     pub fn pid(&self) -> u32 {
@@ -938,7 +1231,8 @@ mod tests {
         agent_proxy_env_vars, agent_schema_params, agent_schema_table_params, agent_supports_capability,
         agent_transaction_params, format_agent_process_error, is_unsupported_handshake_error, mongo_collection_params,
         mongo_database_params, mongo_document_id_params, read_agent_line, AgentCapability, AgentDriverClient,
-        AgentHandshake, AgentKvMethod, AgentMethod, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
+        AgentHandshake, AgentKvMethod, AgentMethod, AgentTableReadCloseParams, AgentTableReadPageParams,
+        AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_PROTOCOL_VERSION,
     };
     use std::io::Cursor;
 
@@ -1086,10 +1380,13 @@ mod tests {
         assert_eq!(AgentMethod::Handshake.as_str(), "handshake");
         assert_eq!(AgentMethod::Connect.as_str(), "connect");
         assert_eq!(AgentMethod::TestConnection.as_str(), "test_connection");
+        assert_eq!(AgentMethod::ValidateConnection.as_str(), "validate_connection");
         assert_eq!(AgentMethod::ListDatabases.as_str(), "list_databases");
         assert_eq!(AgentMethod::ListSchemas.as_str(), "list_schemas");
         assert_eq!(AgentMethod::ListTables.as_str(), "list_tables");
         assert_eq!(AgentMethod::ListObjects.as_str(), "list_objects");
+        assert_eq!(AgentMethod::ListDataTypes.as_str(), "list_data_types");
+        assert_eq!(AgentMethod::CompletionAssistantSearchV1.as_str(), "completion_assistant_search_v1");
         assert_eq!(AgentMethod::GetObjectSource.as_str(), "get_object_source");
         assert_eq!(AgentMethod::GetColumns.as_str(), "get_columns");
         assert_eq!(AgentMethod::ListIndexes.as_str(), "list_indexes");
@@ -1100,6 +1397,10 @@ mod tests {
         assert_eq!(AgentMethod::ExecuteQueryPage.as_str(), "execute_query_page");
         assert_eq!(AgentMethod::FetchQueryPage.as_str(), "fetch_query_page");
         assert_eq!(AgentMethod::CloseQuerySession.as_str(), "close_query_session");
+        assert_eq!(AgentMethod::StartTableRead.as_str(), "start_table_read");
+        assert_eq!(AgentMethod::FetchTableReadPage.as_str(), "fetch_table_read_page");
+        assert_eq!(AgentMethod::CloseTableReadSession.as_str(), "close_table_read_session");
+        assert_eq!(AgentMethod::ExecuteBatch.as_str(), "execute_batch");
         assert_eq!(AgentMethod::ExecuteTransaction.as_str(), "execute_transaction");
         assert_eq!(AgentMethod::Disconnect.as_str(), "disconnect");
         assert_eq!(AgentMethod::Shutdown.as_str(), "shutdown");
@@ -1140,6 +1441,7 @@ mod tests {
         let _execute_query_page = AgentDriverClient::execute_query_page::<serde_json::Value>;
         let _fetch_query_page = AgentDriverClient::fetch_query_page::<serde_json::Value>;
         let _close_query_session = AgentDriverClient::close_query_session::<serde_json::Value>;
+        let _execute_batch = AgentDriverClient::execute_batch::<serde_json::Value>;
         let _execute_transaction = AgentDriverClient::execute_transaction::<serde_json::Value>;
     }
 
@@ -1156,6 +1458,44 @@ mod tests {
     #[test]
     fn exposes_kv_protocol_wrapper() {
         let _call_kv_method = AgentDriverClient::call_kv_method::<serde_json::Value>;
+    }
+
+    #[test]
+    fn exposes_table_read_protocol_wrappers() {
+        let _start_table_read = AgentDriverClient::start_table_read::<serde_json::Value>;
+        let _fetch_table_read_page = AgentDriverClient::fetch_table_read_page::<serde_json::Value>;
+        let _close_table_read_session = AgentDriverClient::close_table_read_session::<serde_json::Value>;
+    }
+
+    #[test]
+    fn serializes_table_read_params_with_agent_field_names() {
+        let start = serde_json::to_value(AgentTableReadStartParams {
+            sql: "SELECT * FROM users".to_string(),
+            database: Some("ORCL".to_string()),
+            schema: Some("APP".to_string()),
+            page_size: 500,
+            max_rows: 1000,
+            fetch_size: Some(500),
+        })
+        .unwrap();
+        assert_eq!(
+            start,
+            serde_json::json!({
+                "sql": "SELECT * FROM users",
+                "database": "ORCL",
+                "schema": "APP",
+                "pageSize": 500,
+                "maxRows": 1000,
+                "fetchSize": 500,
+            })
+        );
+
+        let page = serde_json::to_value(AgentTableReadPageParams { session_id: "table-1".to_string(), page_size: 250 })
+            .unwrap();
+        assert_eq!(page, serde_json::json!({ "sessionId": "table-1", "pageSize": 250 }));
+
+        let close = serde_json::to_value(AgentTableReadCloseParams { session_id: "table-1".to_string() }).unwrap();
+        assert_eq!(close, serde_json::json!({ "sessionId": "table-1" }));
     }
 
     #[test]

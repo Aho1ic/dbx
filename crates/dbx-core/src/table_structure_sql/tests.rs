@@ -118,6 +118,27 @@ fn builds_mysql_column_and_index_changes() {
 }
 
 #[test]
+fn builds_mysql_unsigned_integer_column_with_length_before_attribute() {
+    let mut score = column("score");
+    score.data_type = "int unsigned(11)".to_string();
+
+    let result = build_table_structure_change_sql(TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        schema: None,
+        table_name: "users".to_string(),
+        columns: vec![score],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE `users` ADD COLUMN `score` int(11) unsigned;"]);
+}
+
+#[test]
 fn builds_highgo_foreign_key_changes_with_postgres_syntax() {
     let mut old_fk = foreign_key("orders_user_id_fkey", "user_id", "users", "id");
     old_fk.marked_for_drop = true;
@@ -1807,4 +1828,79 @@ fn postgres_varchar_default_is_quoted() {
     });
 
     assert!(result.statements.iter().any(|s| s.contains("SET DEFAULT 'test label'")));
+}
+
+#[test]
+fn postgres_empty_string_default_is_not_quoted_again() {
+    let mut col = column("sku");
+    col.data_type = "character varying".to_string();
+    col.default_value = "''".to_string();
+    col.original = Some(ColumnInfo {
+        name: "sku".to_string(),
+        data_type: "character varying".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: Some(String::new()),
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        schema: Some("core".to_string()),
+        table_name: "products".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.statements, vec!["ALTER TABLE \"core\".\"products\" ALTER COLUMN \"sku\" SET DEFAULT '';"]);
+}
+
+#[test]
+fn postgres_string_default_cast_matches_plain_literal() {
+    let mut col = column("category");
+    col.data_type = "character varying".to_string();
+    col.default_value = "''".to_string();
+    col.original = Some(ColumnInfo {
+        name: "category".to_string(),
+        data_type: "character varying".to_string(),
+        is_nullable: true,
+        column_default: Some("''::character varying".to_string()),
+        is_primary_key: false,
+        extra: None,
+        comment: Some(String::new()),
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        schema: Some("core".to_string()),
+        table_name: "products".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.statements, Vec::<String>::new());
+}
+
+#[test]
+fn postgres_integer_default_is_not_quoted() {
+    let mut col = column("stock");
+    col.data_type = "integer".to_string();
+    col.default_value = "0".to_string();
+    col.original = Some(ColumnInfo {
+        name: "stock".to_string(),
+        data_type: "integer".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: None,
+        comment: Some(String::new()),
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        schema: Some("core".to_string()),
+        table_name: "products".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.statements, vec!["ALTER TABLE \"core\".\"products\" ALTER COLUMN \"stock\" SET DEFAULT 0;"]);
 }

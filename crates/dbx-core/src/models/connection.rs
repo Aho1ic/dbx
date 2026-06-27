@@ -1,6 +1,7 @@
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ConnectionConfig {
@@ -20,6 +21,8 @@ pub struct ConnectionConfig {
     pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_databases: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
@@ -64,6 +67,8 @@ pub struct ConnectionConfig {
     pub redis_cluster_nodes: String,
     #[serde(default = "default_redis_key_separator", skip_serializing_if = "is_default_redis_separator")]
     pub redis_key_separator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_scan_page_size: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etcd_endpoints: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -194,7 +199,7 @@ pub fn default_ssh_connect_timeout_secs() -> u64 {
 }
 
 pub fn default_connect_timeout_secs() -> u64 {
-    5
+    10
 }
 
 pub fn default_query_timeout_secs() -> u64 {
@@ -206,7 +211,7 @@ pub fn default_idle_timeout_secs() -> u64 {
 }
 
 pub fn default_keepalive_interval_secs() -> u64 {
-    60
+    30
 }
 
 fn default_proxy_port() -> u16 {
@@ -258,6 +263,10 @@ pub enum DatabaseType {
     Qdrant,
     #[serde(rename = "milvus")]
     Milvus,
+    #[serde(rename = "weaviate")]
+    Weaviate,
+    #[serde(rename = "chromadb")]
+    ChromaDb,
     Doris,
     #[serde(rename = "starrocks")]
     StarRocks,
@@ -290,6 +299,8 @@ pub enum DatabaseType {
     H2,
     Snowflake,
     Trino,
+    #[serde(rename = "prestosql")]
+    PrestoSql,
     Hive,
     #[serde(rename = "db2")]
     Db2,
@@ -305,6 +316,9 @@ pub enum DatabaseType {
     Xugu,
     Iotdb,
     Etcd,
+    #[serde(rename = "zookeeper")]
+    ZooKeeper,
+    Nacos,
     #[serde(rename = "iris")]
     Iris,
     #[serde(rename = "turso")]
@@ -338,6 +352,8 @@ struct ConnectionConfigData {
     pub database: Option<String>,
     #[serde(default)]
     pub visible_databases: Option<Vec<String>>,
+    #[serde(default)]
+    pub visible_schemas: Option<HashMap<String, Vec<String>>>,
     #[serde(default)]
     pub attached_databases: Vec<AttachedDatabaseConfig>,
     #[serde(default)]
@@ -383,6 +399,8 @@ struct ConnectionConfigData {
     #[serde(default = "default_redis_key_separator")]
     pub redis_key_separator: String,
     #[serde(default)]
+    pub redis_scan_page_size: Option<u64>,
+    #[serde(default)]
     pub etcd_endpoints: String,
     #[serde(default)]
     pub gbase_server: String,
@@ -415,6 +433,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             password: data.password,
             database: data.database,
             visible_databases: data.visible_databases,
+            visible_schemas: data.visible_schemas,
             attached_databases: data.attached_databases,
             color: data.color,
             transport_layers: data.transport_layers,
@@ -437,6 +456,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             redis_sentinel_tls: data.redis_sentinel_tls,
             redis_cluster_nodes: data.redis_cluster_nodes,
             redis_key_separator: data.redis_key_separator,
+            redis_scan_page_size: data.redis_scan_page_size,
             etcd_endpoints: data.etcd_endpoints,
             gbase_server: data.gbase_server,
             informix_server: data.informix_server,
@@ -713,10 +733,11 @@ impl ConnectionConfig {
             DatabaseType::MongoDb => {
                 let is_tunneled = host != self.host.as_str() || port != self.port;
                 if let Some(cs) = self.connection_string.as_deref().filter(|s| !s.is_empty()) {
+                    let cs = normalize_mongo_uri_direct_connection(cs);
                     if is_tunneled {
-                        return rewrite_mongo_uri_host(cs, &host, port);
+                        return rewrite_mongo_uri_host(&cs, &host, port);
                     }
-                    return cs.to_string();
+                    return cs;
                 }
                 let mut suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
                 if is_tunneled && !suffix.contains("directConnection=") {
@@ -729,7 +750,11 @@ impl ConnectionConfig {
                 format!("mongodb://{host}:{port}{db_part}{suffix}")
             }
             DatabaseType::Oracle => format!("oracle://{host}:{port}{db_part}"),
-            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus => {
+            DatabaseType::Elasticsearch
+            | DatabaseType::Qdrant
+            | DatabaseType::Milvus
+            | DatabaseType::Weaviate
+            | DatabaseType::ChromaDb => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -761,6 +786,7 @@ impl ConnectionConfig {
             DatabaseType::H2 => format!("h2://{host}:{port}{db_part}"),
             DatabaseType::Snowflake => format!("snowflake://{host}/{db_part}"),
             DatabaseType::Trino => format!("trino://{host}:{port}{db_part}"),
+            DatabaseType::PrestoSql => format!("prestosql://{host}:{port}{db_part}"),
             DatabaseType::Hive => format!("hive://{host}:{port}{db_part}"),
             DatabaseType::Db2 => format!("db2://{host}:{port}{db_part}"),
             DatabaseType::Informix => format!("informix://{host}:{port}{db_part}"),
@@ -782,6 +808,9 @@ impl ConnectionConfig {
             DatabaseType::Etcd => {
                 format!("etcd://{host}:{port}")
             }
+            DatabaseType::ZooKeeper => {
+                format!("zookeeper://{host}:{port}")
+            }
             DatabaseType::Iris => format!("iris://{host}:{port}{db_part}"),
             DatabaseType::InfluxDb => {
                 let scheme = if self.ssl { "https" } else { "http" };
@@ -789,6 +818,7 @@ impl ConnectionConfig {
             }
             DatabaseType::Jdbc => "jdbc:<redacted>".to_string(),
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
+            DatabaseType::Nacos => self.nacos_admin_url(),
         }
     }
 
@@ -840,10 +870,11 @@ impl ConnectionConfig {
             DatabaseType::MongoDb => {
                 let is_tunneled = host != self.host.as_str() || port != self.port;
                 if let Some(cs) = self.connection_string.as_deref().filter(|s| !s.is_empty()) {
+                    let cs = normalize_mongo_uri_direct_connection(cs);
                     if is_tunneled {
-                        return rewrite_mongo_uri_host(cs, &host, port);
+                        return rewrite_mongo_uri_host(&cs, &host, port);
                     }
-                    return cs.to_string();
+                    return cs;
                 }
                 let mut suffix = if params.is_empty() { String::new() } else { format!("?{params}") };
                 if is_tunneled && !suffix.contains("directConnection=") {
@@ -862,7 +893,11 @@ impl ConnectionConfig {
             DatabaseType::Oracle => {
                 format!("oracle://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus => {
+            DatabaseType::Elasticsearch
+            | DatabaseType::Qdrant
+            | DatabaseType::Milvus
+            | DatabaseType::Weaviate
+            | DatabaseType::ChromaDb => {
                 let scheme = if self.ssl { "https" } else { "http" };
                 format!("{scheme}://{host}:{port}")
             }
@@ -934,6 +969,9 @@ impl ConnectionConfig {
             DatabaseType::Trino => {
                 format!("trino://{}:{}@{host}:{port}{db_part}", username, password)
             }
+            DatabaseType::PrestoSql => {
+                format!("prestosql://{}:{}@{host}:{port}{db_part}", username, password)
+            }
             DatabaseType::Hive => {
                 format!("hive://{}:{}@{host}:{port}{db_part}", username, password)
             }
@@ -979,6 +1017,13 @@ impl ConnectionConfig {
                     format!("etcd://{}:{}@{host}:{port}", username, password)
                 }
             }
+            DatabaseType::ZooKeeper => {
+                if self.username.is_empty() {
+                    format!("zookeeper://{host}:{port}")
+                } else {
+                    format!("zookeeper://{}:{}@{host}:{port}", username, password)
+                }
+            }
             DatabaseType::Iris => {
                 format!("iris://{}:{}@{host}:{port}{db_part}", username, password)
             }
@@ -990,6 +1035,7 @@ impl ConnectionConfig {
                 self.connection_string.as_deref().filter(|value| !value.is_empty()).unwrap_or("jdbc:").to_string()
             }
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
+            DatabaseType::Nacos => self.nacos_admin_url(),
         }
     }
 
@@ -1001,6 +1047,17 @@ impl ConnectionConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("mq://")
+            .to_string()
+    }
+
+    fn nacos_admin_url(&self) -> String {
+        self.external_config
+            .as_ref()
+            .and_then(|value| value.get("serverAddr").or_else(|| value.get("server_addr")))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("nacos://")
             .to_string()
     }
 
@@ -1023,7 +1080,7 @@ impl ConnectionConfig {
             }
             DatabaseType::Databend => normalize_bare_mysql_url_params(value),
             DatabaseType::Postgres | DatabaseType::Redshift => normalize_postgres_url_params(value, self.ssl),
-            DatabaseType::MongoDb => normalize_mongo_url_params(value, self.ssl),
+            DatabaseType::MongoDb => normalize_mongo_url_params(value, self.ssl, !self.username.trim().is_empty()),
             _ => value.trim_start_matches('?').to_string(),
         }
     }
@@ -1113,7 +1170,7 @@ fn normalize_mysql_url_params(value: &str, force_tls: bool, accept_invalid_certs
     parts.join("&")
 }
 
-fn normalize_mongo_url_params(value: &str, force_tls: bool) -> String {
+fn normalize_mongo_url_params(value: &str, force_tls: bool, default_auth_source: bool) -> String {
     let value = value.trim_start_matches('?');
     let mut parts: Vec<String> = value.split('&').filter(|part| !part.is_empty()).map(str::to_string).collect();
 
@@ -1122,7 +1179,63 @@ fn normalize_mongo_url_params(value: &str, force_tls: bool) -> String {
         parts.insert(0, "tls=true".to_string());
     }
 
+    if default_auth_source && !parts.iter().any(|part| url_param_key_is(part, "authSource")) {
+        parts.push("authSource=admin".to_string());
+    }
+
     parts.join("&")
+}
+
+fn normalize_mongo_uri_direct_connection(uri: &str) -> String {
+    if !mongo_uri_has_multiple_seeds(uri) || !mongo_uri_has_direct_connection_true(uri) {
+        return uri.to_string();
+    }
+
+    let (before_fragment, fragment) =
+        uri.split_once('#').map(|(base, fragment)| (base, Some(fragment))).unwrap_or((uri, None));
+    let Some((base, query)) = before_fragment.split_once('?') else {
+        return uri.to_string();
+    };
+    let params =
+        query.split('&').filter(|part| !mongo_url_param_is_direct_connection_true(part)).collect::<Vec<_>>().join("&");
+
+    let mut normalized = if params.is_empty() { base.to_string() } else { format!("{base}?{params}") };
+    if let Some(fragment) = fragment {
+        normalized.push('#');
+        normalized.push_str(fragment);
+    }
+    normalized
+}
+
+fn mongo_uri_has_multiple_seeds(uri: &str) -> bool {
+    mongo_uri_host_section(uri)
+        .map(|hosts| hosts.split(',').filter(|host| !host.trim().is_empty()).count() > 1)
+        .unwrap_or(false)
+}
+
+fn mongo_uri_host_section(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("mongodb://").or_else(|| uri.strip_prefix("mongodb+srv://"))?;
+    let authority = rest.split('/').next()?.split('?').next().unwrap_or(rest);
+    Some(match authority.rfind('@') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    })
+}
+
+fn mongo_uri_has_direct_connection_true(uri: &str) -> bool {
+    uri.split_once('?')
+        .map(|(_, query)| {
+            query.split('#').next().unwrap_or("").split('&').any(mongo_url_param_is_direct_connection_true)
+        })
+        .unwrap_or(false)
+}
+
+fn mongo_url_param_is_direct_connection_true(part: &str) -> bool {
+    let Some((key, value)) = part.split_once('=') else {
+        return false;
+    };
+    percent_decode_str(key).decode_utf8_lossy().eq_ignore_ascii_case("directConnection")
+        && percent_decode_str(value).decode_utf8_lossy().eq_ignore_ascii_case("true")
 }
 
 fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
@@ -1455,6 +1568,7 @@ mod tests {
             password: password.to_string(),
             database: database.map(str::to_string),
             visible_databases: None,
+            visible_schemas: None,
             attached_databases: Vec::new(),
             color: None,
             transport_layers: Vec::new(),
@@ -1477,6 +1591,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -1493,6 +1608,27 @@ mod tests {
         config.db_type = DatabaseType::MongoDb;
         config.port = 17000;
         config
+    }
+
+    #[test]
+    fn zookeeper_database_type_uses_stable_wire_name() {
+        assert_eq!(serde_json::to_string(&DatabaseType::ZooKeeper).unwrap(), "\"zookeeper\"");
+        assert_eq!(serde_json::from_str::<DatabaseType>("\"zookeeper\"").unwrap(), DatabaseType::ZooKeeper);
+    }
+
+    #[test]
+    fn zookeeper_connection_url_uses_zookeeper_scheme() {
+        let mut config = mysql_config("", "", None);
+        config.db_type = DatabaseType::ZooKeeper;
+        config.host = "zk.local".to_string();
+        config.port = 2181;
+
+        assert_eq!(config.connection_url_with_host("zk.local", 2181), "zookeeper://zk.local:2181");
+
+        config.username = "digest".to_string();
+        config.password = "secret".to_string();
+
+        assert_eq!(config.connection_url_with_host("zk.local", 2181), "zookeeper://digest:secret@zk.local:2181");
     }
 
     #[test]
@@ -1525,6 +1661,24 @@ mod tests {
         assert_eq!(hops[0].password, "secret");
         assert_eq!(hops[0].connect_timeout_secs, default_ssh_connect_timeout_secs());
         assert!(hops[0].expose_lan);
+    }
+
+    #[test]
+    fn missing_connection_timeout_defaults_to_ten_seconds() {
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "id",
+            "name": "name",
+            "db_type": "mysql",
+            "host": "10.1.2.3",
+            "port": 3306,
+            "username": "root",
+            "password": "",
+            "database": null
+        }))
+        .unwrap();
+
+        assert_eq!(config.connect_timeout_secs, 10);
+        assert_eq!(config.effective_connect_timeout_secs(), 10);
     }
 
     #[test]
@@ -1987,10 +2141,32 @@ mod tests {
     }
 
     #[test]
-    fn mongodb_form_url_without_params_does_not_force_topology_or_auth() {
+    fn mongodb_form_url_without_params_defaults_auth_source_to_admin() {
         let config = mongodb_config("root", "secret", Some("admin"));
 
-        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin");
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_form_url_default_database_does_not_change_auth_source() {
+        let config = mongodb_config("root", "secret", Some("app"));
+
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/app?authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_form_url_without_username_does_not_default_auth_source() {
+        let config = mongodb_config("", "", Some("app"));
+
+        assert_eq!(config.connection_url(), "mongodb://10.1.2.3:17000/app");
+    }
+
+    #[test]
+    fn mongodb_form_url_preserves_explicit_auth_source() {
+        let mut config = mongodb_config("root", "secret", Some("app"));
+        config.url_params = Some("authSource=app".to_string());
+
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/app?authSource=app");
     }
 
     #[test]
@@ -2078,8 +2254,8 @@ mod tests {
         let mut config = mongodb_config("root", "secret", Some("admin"));
         config.ssl = true;
 
-        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?tls=true");
-        assert_eq!(config.redacted_connection_url(), "mongodb://10.1.2.3:17000/admin?tls=true");
+        assert_eq!(config.connection_url(), "mongodb://root:secret@10.1.2.3:17000/admin?tls=true&authSource=admin");
+        assert_eq!(config.redacted_connection_url(), "mongodb://10.1.2.3:17000/admin?tls=true&authSource=admin");
     }
 
     #[test]
@@ -2145,6 +2321,30 @@ mod tests {
         let url = config.connection_url();
 
         assert_eq!(url, "mongodb://read:pass@host1:27017,host2:27017/admin?replicaSet=rs0");
+    }
+
+    #[test]
+    fn mongodb_multi_seed_connection_string_removes_direct_connection_true() {
+        let mut config = mongodb_config("root", "secret", Some("admin"));
+        config.connection_string = Some(
+            "mongodb://read:pass@host1:27017,host2:27017/admin?directConnection=true&replicaSet=rs0&authSource=admin"
+                .to_string(),
+        );
+
+        let url = config.connection_url();
+
+        assert_eq!(url, "mongodb://read:pass@host1:27017,host2:27017/admin?replicaSet=rs0&authSource=admin");
+    }
+
+    #[test]
+    fn mongodb_single_seed_connection_string_keeps_direct_connection_true() {
+        let mut config = mongodb_config("root", "secret", Some("admin"));
+        config.connection_string =
+            Some("mongodb://read:pass@host1:27017/admin?directConnection=true&authSource=admin".to_string());
+
+        let url = config.connection_url();
+
+        assert_eq!(url, "mongodb://read:pass@host1:27017/admin?directConnection=true&authSource=admin");
     }
 
     #[test]
