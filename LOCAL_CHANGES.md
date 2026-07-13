@@ -10,6 +10,7 @@
 - 上游仓库：`https://github.com/t8y2/dbx.git`
 - 合并前本地提交：`2a888c6879fe22cbd37a12e4395f55d5113ac262`
 - 本次上游提交：`ae0e3a2a57b6c1f6c76a5e35dc288d05c550b0b0`
+- 最终上游合并提交：`c3117ab27a54549448375d2cc047227bbf2bce2b`
 - 上游版本跨度：`v0.5.39` 到 `v0.5.56`
 - 共同基线：`44884efa9bfda70f113a92bea8797647c22ebd51`
 - 合并前备份分支：`backup/pre-upstream-merge-20260713`
