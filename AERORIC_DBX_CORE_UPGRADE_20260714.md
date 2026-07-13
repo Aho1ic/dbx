@@ -2,7 +2,7 @@
 
 ## 1. 文档目的
 
-本文用于把 Aeroric 的数据库内核从 DBX `v0.5.39` 附近升级到本次合并后的 `v0.5.55` 上游状态，并记录 DBX fork 必须继续保留的本地修改。
+本文用于把 Aeroric 的数据库内核从 DBX `v0.5.39` 附近升级到本次合并后的 `v0.5.56` 上游状态，并记录 DBX fork 必须继续保留的本地修改。
 
 本文基于以下两个项目的实际代码和一次隔离编译检查：
 
@@ -20,14 +20,14 @@
 | 基线日期 | 2026-06-27 20:03:16 +0800 |
 | 基线最近标签 | `v0.5.39` |
 | 合并前本地 HEAD | `2a888c6879fe22cbd37a12e4395f55d5113ac262` |
-| 本次目标提交 | `8f619fb79145518fad073ffd4b7334626fffba51` |
-| 目标日期 | 2026-07-13 21:27:02 +0800 |
-| 目标最近标签 | `v0.5.55` |
+| 本次目标提交 | `ae0e3a2a57b6c1f6c76a5e35dc288d05c550b0b0` |
+| 目标日期 | 2026-07-13 17:51:34 +0000 |
+| 目标最近标签 | `v0.5.56` |
 | 备份分支 | `backup/pre-upstream-merge-20260713` |
 
-从共同基线计算，本地有 6 个提交，上游有 779 个提交。`crates/dbx-core` 在该区间约有 275 个提交，涉及 141 个文件，变化规模约为 45,484 行新增、3,289 行删除。
+从共同基线计算，合并前本地分叉有 6 个提交，上游有 796 个提交。`crates/dbx-core` 在该区间有 282 个提交，涉及 141 个文件，变化规模约为 46,345 行新增、3,343 行删除。
 
-完成本次 merge commit 后仍需再次执行 `git fetch origin --prune`。如果 `origin/main` 在 2026-07-13 的 `8f619fb7` 之后继续前进，应再合并到当时最新提交，并重新运行本文的验证步骤。
+第一次合并 `8f619fb7` 后重新 fetch，发现上游又增加 17 个提交并发布 `v0.5.56`，因此继续合并到 `ae0e3a2a`。最终 merge commit 后仍应再次执行 `git fetch origin --prune`；如果 `origin/main` 继续前进，需再次合并并重新运行本文的验证步骤。
 
 ## 3. 合并冲突和处理方式
 
@@ -252,11 +252,11 @@ aeroric dependencies:
 + quick-xml 0.37.5
 ```
 
-依赖完成编译后，Aeroric 自身出现 17 个 Rust 编译错误，分为下列 9 组接口变化。
+依赖完成编译后，Aeroric 自身出现 17 个 Rust 编译错误，分为下列 10 组接口变化。
 
 ## 7. 17 个编译错误逐项修复
 
-### 7.1 表数据 SQL 选项增加 catalog 和 identifier_quote
+### 7.1 表数据 SQL 选项增加 catalog、database 和 identifier_quote
 
 位置：
 
@@ -269,12 +269,14 @@ aeroric dependencies:
 TableDataSelectSqlOptions {
     identifier_quote: Option<String>,
     catalog: Option<String>,
+    database: Option<String>,
     ...
 }
 
 DataGridCountSqlOptions {
     identifier_quote: Option<String>,
     catalog: Option<String>,
+    database: Option<String>,
     ...
 }
 ```
@@ -284,14 +286,15 @@ DataGridCountSqlOptions {
 ```rust
 identifier_quote: None,
 catalog: None,
+database: None,
 ```
 
 完整接入：
 
-1. 给 `TableDataRequest` 增加 `catalog?: string`。
+1. 给 `TableDataRequest` 增加 `catalog?: string`，并明确 `database` 是外部 catalog 下的中间限定名。
 2. 从连接配置或驱动元数据取得 `identifier_quote`。
 3. `databaseApi.ts` 和 `TableDataRequest` TypeScript 类型同步增加字段。
-4. 生成查询 SQL 和 count SQL 时传递同一组 catalog/quote，避免主查询和计数查询指向不同对象。
+4. 生成查询 SQL 和 count SQL 时传递同一组 catalog/database/quote，避免主查询和计数查询指向不同对象。
 
 ### 7.2 Mongo find 增加 projection
 
@@ -666,7 +669,7 @@ src/hooks/useRedisBrowser.ts
 
 ## 13. 许可证风险
 
-本地 DBX `LICENSE` 是 MIT，Copyright Aho1ic；目标上游提交 `8f619fb7` 的 `LICENSE` 是 Apache-2.0。
+本地 DBX `LICENSE` 是 MIT，Copyright Aho1ic；目标上游提交 `ae0e3a2a` 的 `LICENSE` 是 Apache-2.0。
 
 这不是普通的冲突保留问题。把大量 Apache-2.0 上游代码合入后，仅在根目录放置 MIT 文本不等于可以移除上游许可证、版权和 NOTICE 义务。Aeroric 发布二进制、源码或内置 DBX 内核前，应完成以下审查：
 

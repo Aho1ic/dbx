@@ -56,6 +56,7 @@ const TableInfoView = defineAsyncComponent(() => import("@/components/grid/Table
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
 const DatabaseUserAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseUserAdmin.vue"));
 const MySqlProcessList = defineAsyncComponent(() => import("@/components/admin/MySqlProcessList.vue"));
+const MySqlDashboard = defineAsyncComponent(() => import("@/components/admin/MySqlDashboard.vue"));
 const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/DamengJobAdmin.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
@@ -1594,6 +1595,12 @@ defineExpose({ focusSearch, refreshData, handleModRTarget, requestQueryEditorExe
 
     <template v-else-if="activeTab.mode === 'processlist' && activeConnection">
       <MySqlProcessList :key="activeTab.id" :connection="activeConnection" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'mysql-dashboard'">
+      <div class="min-h-0 flex-1">
+        <MySqlDashboard :key="activeTab.id" :connection-id="activeTab.connectionId" />
+      </div>
     </template>
 
     <template v-else-if="activeTab.mode === 'dameng-jobs' && activeConnection">
