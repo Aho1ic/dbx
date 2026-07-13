@@ -4,6 +4,7 @@ export type DatabaseType =
   | "sqlite"
   | "rqlite"
   | "turso"
+  | "cloudflare-d1"
   | "redis"
   | "duckdb"
   | "clickhouse"
@@ -44,6 +45,7 @@ export type DatabaseType =
   | "trino"
   | "prestosql"
   | "hive"
+  | "spark"
   | "db2"
   | "informix"
   | "neo4j"
@@ -51,6 +53,7 @@ export type DatabaseType =
   | "bigquery"
   | "kylin"
   | "sundb"
+  | "oscar"
   | "tdengine"
   | "xugu"
   | "iotdb"
@@ -67,6 +70,7 @@ export interface SqlSnippet {
   label: string;
   prefix: string;
   body: string;
+  enabled?: boolean;
 }
 
 export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column";
@@ -115,6 +119,7 @@ export interface ConnectionConfig {
   driver_profile?: string;
   driver_label?: string;
   url_params?: string;
+  agent_java_options?: string[];
   host: string;
   port: number;
   username: string;
@@ -123,6 +128,7 @@ export interface ConnectionConfig {
   visible_databases?: string[];
   visible_schemas?: Record<string, string[]>;
   attached_databases?: AttachedDatabaseConfig[];
+  init_script?: string;
   color?: string;
   transport_layers?: TransportLayerConfig[];
   connect_timeout_secs?: number;
@@ -153,9 +159,21 @@ export interface ConnectionConfig {
   external_config?: unknown;
   one_time?: boolean;
   read_only?: boolean;
+  /** Explicit production marker for every database reachable through this connection. */
+  is_production?: boolean;
+  /** Database-level production markers for multi-database connections. */
+  production_databases?: string[];
 }
 
-export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig);
+export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig) | ({ type: "http_tunnel" } & HttpTunnelConfig);
+
+/**
+ * A shared tunnel configuration managed in Settings > Tunnels. Structurally a
+ * `TransportLayerConfig`; its `id` is what connection layers reference via
+ * `profile_id`. Edits to a profile apply to every referencing connection the
+ * next time it connects.
+ */
+export type TunnelProfile = TransportLayerConfig;
 
 export interface SshTunnelConfig {
   id: string;
@@ -171,6 +189,31 @@ export interface SshTunnelConfig {
   expose_lan?: boolean;
   use_ssh_agent?: boolean;
   ssh_agent_sock_path?: string;
+  /**
+   * UI-facing choice of login method. Drives which credential inputs the
+   * connection dialog shows; the backend still probes "none" then falls
+   * back to key > password > agent based on which fields are non-empty,
+   * independent of this selector (see `db/ssh_tunnel.rs`).
+   *
+   * `"agent"` is a legacy value: it's no longer offered as a dropdown
+   * choice for new connections, but is preserved and displayed read-only
+   * for connections that already have `use_ssh_agent` configured.
+   */
+  auth_method?: "password" | "key" | "agent" | "none";
+  /**
+   * When set, this layer references a shared tunnel profile; the profile's
+   * configuration replaces this layer's fields at connect time (only `id`
+   * and `enabled` are kept).
+   */
+  profile_id?: string;
+}
+
+export interface SshConfigHostEntry {
+  alias: string;
+  host_name?: string;
+  port?: number;
+  user?: string;
+  identity_file?: string;
 }
 
 export interface ProxyTunnelConfig {
@@ -182,6 +225,19 @@ export interface ProxyTunnelConfig {
   port: number;
   username?: string;
   password?: string;
+  /** See {@link SshTunnelConfig.profile_id}. */
+  profile_id?: string;
+}
+
+export interface HttpTunnelConfig {
+  id: string;
+  name?: string;
+  enabled?: boolean;
+  url: string;
+  token?: string;
+  connect_timeout_secs?: number;
+  /** See {@link SshTunnelConfig.profile_id}. */
+  profile_id?: string;
 }
 
 export interface AttachedDatabaseConfig {
@@ -240,6 +296,21 @@ export interface JdbcMavenBundleInfo {
   artifacts: JdbcMavenArtifactInfo[];
 }
 
+export interface JdbcLocalArtifactInfo {
+  file_name: string;
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+export interface JdbcLocalBundleInfo {
+  id: string;
+  name: string;
+  installed_at: string;
+  path: string;
+  artifacts: JdbcLocalArtifactInfo[];
+}
+
 export interface JdbcPluginStatus {
   installed: boolean;
   version?: string | null;
@@ -267,6 +338,14 @@ export interface LinkedServerInfo {
   data_source?: string | null;
 }
 
+/** A catalog exposed by a multi-catalog engine (Doris / StarRocks). */
+export interface CatalogInfo {
+  name: string;
+  catalog_type: string;
+  is_current: boolean;
+  comment?: string | null;
+}
+
 export interface TableInfo {
   name: string;
   table_type: string;
@@ -281,6 +360,7 @@ export interface ObjectInfo {
   name: string;
   object_type: DatabaseObjectType | string;
   schema?: string | null;
+  signature?: string | null;
   comment?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
@@ -302,6 +382,7 @@ export interface ObjectSource {
   object_type: ObjectSourceKind;
   schema?: string | null;
   source: string;
+  editable?: boolean;
 }
 
 export interface ColumnInfo {
@@ -315,6 +396,9 @@ export interface ColumnInfo {
   numeric_precision?: number | null;
   numeric_scale?: number | null;
   character_maximum_length?: number | null;
+  enum_values?: string[] | null;
+  character_set?: string | null;
+  collation?: string | null;
 }
 
 export interface IndexInfo {
@@ -370,6 +454,13 @@ export interface RuleInfo {
   definition: string;
 }
 
+export interface ExtensionInfo {
+  name: string;
+  version: string;
+  comment?: string | null;
+  schema?: string | null;
+}
+
 export interface OwnerInfo {
   object_name: string;
   object_type: string;
@@ -378,6 +469,10 @@ export interface OwnerInfo {
 
 export interface QueryResult {
   columns: string[];
+  /** Set for synthesized query execution failures. */
+  execution_error?: true;
+  /** Internal row identifiers appended to editable query results. */
+  hidden_column_indexes?: number[];
   /**
    * Database type name for each column, parallel to `columns`. Optional and may
    * be shorter/empty when a driver cannot supply types (schemaless stores,
@@ -390,11 +485,21 @@ export interface QueryResult {
    */
   column_sortables?: boolean[];
   rows: (string | number | boolean | null)[][];
+  /**
+   * Original MongoDB documents, kept in lockstep with `rows` for document
+   * preview. This is populated only for MongoDB document query results.
+   */
+  mongo_documents?: unknown[];
   affected_rows: number;
   execution_time_ms: number;
   truncated?: boolean;
   session_id?: string | null;
   has_more?: boolean;
+  sourceLabel?: string;
+  sourceStatement?: string;
+  /** Absolute offsets in the editor document at execution time. */
+  sourceFrom?: number;
+  sourceTo?: number;
 }
 
 export interface QueryResultRun {
@@ -413,6 +518,7 @@ export interface QueryResultRun {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -428,6 +534,7 @@ export interface QueryResultRun {
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
+  mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
 }
 
@@ -443,23 +550,32 @@ export interface SqlTableReference {
   schema?: string | null;
   alias?: string | null;
   span: SqlTextSpan;
+  scope_id?: number;
 }
 
 export interface SqlColumnReference {
   name: string;
   qualifier?: string | null;
   span: SqlTextSpan;
+  scope_id?: number;
+}
+
+export interface SqlReferenceScope {
+  id: number;
+  parent_id?: number | null;
 }
 
 export interface SqlReferenceAnalysis {
   tables: SqlTableReference[];
   columns: SqlColumnReference[];
+  scopes?: SqlReferenceScope[];
 }
 
 export type TreeNodeType =
   | "connection"
   | "connection-group"
   | "database"
+  | "doris-catalog"
   | "linked-server-root"
   | "linked-server"
   | "linked-server-catalog"
@@ -485,11 +601,15 @@ export type TreeNodeType =
   | "group-sequences"
   | "group-packages"
   | "group-partitions"
+  | "group-extensions"
+  | "extension"
   | "object-browser"
   | "user-admin"
+  | "dameng-job-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
+  | "table-search-control"
   | "load-more"
   | "column"
   | "index"
@@ -501,7 +621,11 @@ export type TreeNodeType =
   | "etcd-root"
   | "zookeeper-root"
   | "mongo-db"
+  | "mongo-gridfs"
+  | "mongo-buckets"
+  | "mongo-bucket"
   | "mongo-collection"
+  | "vector-database"
   | "vector-collection"
   | "elasticsearch-index";
 
@@ -528,14 +652,19 @@ export interface TreeNode {
   pinned?: boolean;
   connectionId?: string;
   database?: string;
+  catalog?: string;
+  catalogType?: string;
   linkedServer?: string;
   linkedCatalog?: string;
   linkedSchema?: string;
   mqTenant?: string;
+  mqInitialTab?: "topics";
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   schema?: string;
   tableName?: string;
+  objectName?: string;
+  signature?: string;
   tableType?: string;
   comment?: string | null;
   objectCount?: number;
@@ -544,9 +673,10 @@ export interface TreeNode {
   partitionParentSchema?: string;
   partitionParentName?: string;
   hiddenChildren?: TreeNode[];
+  tableSearchParentId?: string;
   savedSqlId?: string;
   savedSqlFolderId?: string;
-  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | VectorCollectionMeta;
+  meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ExtensionInfo | VectorCollectionMeta;
   loadMore?: {
     parentId: string;
     offset: number;
@@ -555,6 +685,37 @@ export interface TreeNode {
 }
 
 export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
+
+export interface TableStructureEditorTarget {
+  kind: "column" | "index";
+  name: string;
+}
+
+export interface TableStructureEditorDraft {
+  dirty?: boolean;
+  activeTab: TableInfoTab;
+  newTableName: string;
+  tableComment: string;
+  originalTableComment: string;
+  columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
+  indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
+  foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
+  triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
+  scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
+  initialized: boolean;
+}
+
+export interface TableStructureEditorViewport {
+  scrollTop: number;
+  scrollLeft: number;
+}
+
+export type ObjectBrowserViewMode = "list" | "grid";
+
+export interface ObjectBrowserViewport {
+  scrollTop: number;
+  viewMode: ObjectBrowserViewMode;
+}
 
 export interface QueryTab {
   id: string;
@@ -575,6 +736,7 @@ export interface QueryTab {
   resultSortDirection?: "asc" | "desc";
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
+  resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   orderByInput?: string;
   resultPageSql?: string;
   resultPageLimit?: number;
@@ -593,9 +755,13 @@ export interface QueryTab {
   resultRuns?: QueryResultRun[];
   activeResultRunId?: string;
   resultAutoSave?: boolean;
-  explainPlan?: import("@/lib/explainPlan").ParsedExplainPlan;
+  explainPlan?: import("@/lib/diagram/explainPlan").ParsedExplainPlan;
+  /** MySQL's regular EXPLAIN result, kept alongside its JSON visual plan. */
+  explainTableResult?: QueryResult;
   explainError?: string;
+  explainTableError?: string;
   explainSql?: string;
+  explainTableSql?: string;
   lastExplainedSql?: string;
   isExecuting: boolean;
   isCancelling?: boolean;
@@ -611,21 +777,23 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "users" | "tableInfo";
+  /** Per-run connection session for sequential MySQL explain formats. */
+  explainClientSessionId?: string;
+  mode: "data" | "query" | "redis" | "redis-dashboard" | "mongo" | "mongo-gridfs" | "mongo-bucket" | "vector" | "etcd" | "zookeeper" | "mq" | "nacos" | "objects" | "structure" | "tableInfo" | "users" | "dameng-jobs" | "processlist";
   mqTenant?: string;
+  mqInitialTab?: "topics";
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   structureTableName?: string;
-  tableInfoTarget?: {
-    schema?: string;
-    tableName: string;
-    columns: ColumnInfo[];
-    primaryKeys: string[];
-  };
-  tableInfoActiveTab?: "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
+  structureInitialTab?: TableInfoTab;
+  structureInitialTabRequestId?: number;
+  structureInitialTarget?: TableStructureEditorTarget;
+  structureDraft?: TableStructureEditorDraft;
   objectBrowser?: {
+    catalog?: string;
     schema?: string;
     objectType?: "tables";
+    viewport?: ObjectBrowserViewport;
   };
   objectSource?: {
     schema?: string;
@@ -636,30 +804,71 @@ export interface QueryTab {
     schema?: string;
     tableName: string;
     tableType?: string;
+    catalog?: string;
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
-  tableInfoTab?: TableInfoTab;
+  tableInfoTarget?: {
+    catalog?: string;
+    schema?: string;
+    tableName: string;
+    columns: ColumnInfo[];
+    primaryKeys: string[];
+  };
+  tableInfoActiveTab?: TableInfoTab;
   queryAnalysis?: {
+    catalog?: string;
+    catalogQuoted?: boolean;
     schema?: string;
     schemaQuoted?: boolean;
     tableName: string;
     tableNameQuoted?: boolean;
     tableAlias?: string;
     selectStar: boolean;
+    editableSourceKey?: string;
+    multiSource?: boolean;
+    allowInsert?: boolean;
+    allowInsertDelete?: boolean;
+    sources?: {
+      key: string;
+      catalog?: string;
+      catalogQuoted?: boolean;
+      schema?: string;
+      schemaQuoted?: boolean;
+      tableName: string;
+      tableNameQuoted?: boolean;
+      alias?: string;
+    }[];
     columns: {
       sourceName?: string;
       sourceNameQuoted?: boolean;
+      sourceQualifier?: string;
+      sourceKey?: string;
+      star?: boolean;
       resultName: string;
       expression: string;
     }[];
   };
   querySourceColumns?: Array<string | undefined>;
   queryEditabilityReason?: "not-select" | "cte" | "set-operation" | "aggregation" | "external-source" | "complex-source" | "computed-columns" | "no-table" | "no-primary-key" | "primary-key-not-returned" | "aliased-columns" | "metadata-unavailable";
+  mongoEditTarget?: {
+    collection: string;
+    idColumn: "_id";
+  };
+  mongoBucket?: {
+    bucketName: string;
+  };
   resultEvicted?: boolean;
   whereInput?: string;
   previewSql?: string;
+  /** Whether to use auto-commit mode (default true). When false, multiple statements are
+   *  wrapped in a single transaction. */
+  autoCommit?: boolean;
+  /** Session ID for an active manual transaction, set after beginManualTransaction */
+  txnSessionId?: string;
+  /** Set to true when a manual transaction was auto-rolled back due to inactivity */
+  txnAutoRolledBack?: boolean;
 }
 
 export interface SavedSqlFolder {
@@ -695,10 +904,13 @@ export interface SavedSqlLibrary {
 
 export interface VectorCollectionMeta {
   dimension?: number;
+  collectionId?: string;
 }
 
 export interface CollectionInfo {
   name: string;
   id: string;
   dimension?: number;
+  kind?: "collection" | "bucket";
+  bucketName?: string;
 }

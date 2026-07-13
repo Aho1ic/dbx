@@ -9,6 +9,29 @@ const APP_PUBLISH_WORKFLOW = "publish-packages.yml";
 const PACKAGE_TAG_PREFIX = "packages-v";
 const AGENT_TAG_PREFIX = "agents-v";
 const APP_TAG_PREFIX = "v";
+const PACKAGE_RELEASE_PATHS = [
+  "packages/node-core/src/",
+  "packages/node-core/README.md",
+  "packages/node-core/package.json",
+  "packages/node-core/tsconfig.json",
+  "packages/cli/src/",
+  "packages/cli/README.md",
+  "packages/cli/package.json",
+  "packages/cli/tsconfig.json",
+  "packages/mcp-server/src/",
+  "packages/mcp-server/README.md",
+  "packages/mcp-server/package.json",
+  "packages/mcp-server/server.json",
+  "packages/mcp-server/tsconfig.json",
+];
+const AGENT_RELEASE_PATHS = [
+  "agents/build.gradle",
+  "agents/settings.gradle",
+  "agents/versions.json",
+  "agents/common/build.gradle",
+  "agents/common/src/main/",
+  "agents/drivers/",
+];
 
 const args = process.argv.slice(2);
 let target = null;
@@ -16,6 +39,24 @@ let requestedBump = null;
 let dryRun = false;
 let yes = false;
 let skipFetch = false;
+let force = false;
+
+// NO_COLOR (https://no-color.org) wins, then FORCE_COLOR, then autodetect TTY.
+const USE_COLOR = !process.env.NO_COLOR && (process.stdout.isTTY || (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== "0"));
+function ansi(code, text) {
+  return USE_COLOR ? `\x1b[${code}m${text}\x1b[0m` : text;
+}
+const bold = (s) => ansi(1, s);
+const dim = (s) => ansi(2, s);
+const cyan = (s) => ansi(36, s);
+const green = (s) => ansi(32, s);
+const yellow = (s) => ansi(33, s);
+const red = (s) => ansi(31, s);
+const magenta = (s) => ansi(35, s);
+// `Label: value` with a dimmed label and a colored value.
+function kv(label, value, color = cyan) {
+  return `${dim(label)}: ${color(value)}`;
+}
 
 for (const arg of args) {
   switch (arg) {
@@ -30,6 +71,9 @@ for (const arg of args) {
       break;
     case "--skip-fetch":
       skipFetch = true;
+      break;
+    case "--force":
+      force = true;
       break;
     case "-h":
     case "--help":
@@ -75,54 +119,68 @@ if (target === "packages") {
 }
 
 async function releasePackages(bump) {
-  const latestVersion = getLatestPackageVersion();
+  const status = getPackageReleaseStatus();
+  const latestVersion = status.latestVersion ?? getLatestPackageVersion();
   const releaseVersion = resolveReleaseVersion(bump, latestVersion, PACKAGE_TAG_PREFIX);
   const releaseTag = `${PACKAGE_TAG_PREFIX}${releaseVersion}`;
   const workflowArgs = ["workflow", "run", PACKAGES_WORKFLOW, "--repo", REPO, "-f", `version=${releaseVersion}`];
 
-  console.log(`Release target: Node packages / MCP`);
-  console.log(`Current package version: ${latestVersion ?? "none"}`);
-  console.log(`New package version: ${releaseVersion}`);
-  console.log(`Release tag: ${releaseTag}`);
-  console.log(`Workflow: Node Packages Release (${PACKAGES_WORKFLOW})`);
-  console.log(`Command: gh ${workflowArgs.join(" ")}`);
+  console.log(kv("Release target", "Node packages / MCP", bold));
+  console.log(kv("Current package version", latestVersion ?? "none", green));
+  printReleaseStatus(status);
+  if (!status.needed && !force) {
+    console.log(yellow("No Node package release needed; publish-relevant package files have not changed."));
+    console.log(dim("Use --force to trigger the workflow anyway."));
+    return;
+  }
+  console.log(kv("New package version", releaseVersion, green));
+  console.log(kv("Release tag", releaseTag, yellow));
+  console.log(kv("Workflow", `Node Packages Release (${PACKAGES_WORKFLOW})`, magenta));
+  console.log(kv("Command", `gh ${workflowArgs.join(" ")}`, dim));
 
   if (dryRun) {
-    console.log("Dry run only; workflow was not triggered.");
+    console.log(dim("Dry run only; workflow was not triggered."));
     return;
   }
 
   ensureGhReady(PACKAGES_WORKFLOW);
-  await confirmOrExit(`Confirm triggering Node Packages Release for ${releaseVersion}? [y/N] `);
+  await confirmOrExit(`Confirm triggering Node Packages Release for ${bold(releaseVersion)}? [y/N] `);
 
   run("gh", workflowArgs, { stdio: "inherit" });
-  console.log(`Triggered Node Packages Release for ${releaseVersion}.`);
+  console.log(green(`Triggered Node Packages Release for ${releaseVersion}.`));
 }
 
 async function releaseAgents(bump) {
   const latest = getLatestAgentTag();
+  const status = getAgentReleaseStatus(latest);
   const releaseTag = resolveAgentTag(bump, latest.tag);
 
   if (tagExists(releaseTag)) {
     fail(`Tag ${releaseTag} already exists.`);
   }
 
-  console.log(`Release target: Agents`);
-  console.log(`Current agent tag: ${latest.tag}${latest.source ? ` (${latest.source})` : ""}`);
-  console.log(`New agent tag: ${releaseTag}`);
-  console.log(`Workflow: Agents Release (.github/workflows/agents-release.yml)`);
-  console.log(`Commands: git tag ${releaseTag} && git push origin ${releaseTag}`);
+  console.log(kv("Release target", "Agents", bold));
+  console.log(kv("Current agent tag", `${latest.tag}${latest.source ? ` (${latest.source})` : ""}`, yellow));
+  printReleaseStatus(status);
+  if (!status.needed && !force) {
+    console.log(yellow("No agents release needed; publish-relevant agent runtime files have not changed."));
+    console.log(dim("Use --force to create the tag anyway."));
+    return;
+  }
+  console.log(kv("New agent tag", releaseTag, yellow));
+  console.log(kv("Workflow", "Agents Release (.github/workflows/agents-release.yml)", magenta));
+  console.log(kv("Commands", `git tag ${releaseTag} && git push origin ${releaseTag}`, dim));
 
   if (dryRun) {
-    console.log("Dry run only; tag was not created or pushed.");
+    console.log(dim("Dry run only; tag was not created or pushed."));
     return;
   }
 
-  await confirmOrExit(`Confirm creating and pushing tag ${releaseTag}? [y/N] `);
+  await confirmOrExit(`Confirm creating and pushing tag ${bold(releaseTag)}? [y/N] `);
 
   run("git", ["tag", releaseTag], { stdio: "inherit" });
   run("git", ["push", "origin", releaseTag], { stdio: "inherit" });
-  console.log(`Pushed ${releaseTag}; Agents Release will run from the tag push.`);
+  console.log(green(`Pushed ${releaseTag}; Agents Release will run from the tag push.`));
 }
 
 async function publishApp(tagInput) {
@@ -130,31 +188,33 @@ async function publishApp(tagInput) {
   const releaseTag = tagInput ? resolveAppTag(tagInput) : latest.tag;
   const workflowArgs = ["workflow", "run", APP_PUBLISH_WORKFLOW, "--repo", REPO, "-f", `tag=${releaseTag}`];
 
-  console.log(`Release target: App distribution`);
-  console.log(`Latest app tag: ${latest.tag}`);
-  console.log(`Publish tag: ${releaseTag}`);
-  console.log(`Workflow: Publish Packages (${APP_PUBLISH_WORKFLOW})`);
-  console.log(`Command: gh ${workflowArgs.join(" ")}`);
+  console.log(kv("Release target", "App distribution", bold));
+  console.log(kv("Latest app tag", latest.tag, yellow));
+  console.log(kv("Publish tag", releaseTag, yellow));
+  console.log(kv("Workflow", `Publish Packages (${APP_PUBLISH_WORKFLOW})`, magenta));
+  console.log(kv("Command", `gh ${workflowArgs.join(" ")}`, dim));
 
   if (dryRun) {
-    console.log("Dry run only; workflow was not triggered.");
+    console.log(dim("Dry run only; workflow was not triggered."));
     return;
   }
 
   ensureGhReady(APP_PUBLISH_WORKFLOW);
   run("gh", ["release", "view", releaseTag, "--repo", REPO], { stdio: "inherit" });
-  await confirmOrExit(`Confirm publishing app distribution for ${releaseTag}? [y/N] `);
+  await confirmOrExit(`Confirm publishing app distribution for ${bold(releaseTag)}? [y/N] `);
 
   run("gh", workflowArgs, { stdio: "inherit" });
-  console.log(`Triggered Publish Packages for ${releaseTag}.`);
+  console.log(green(`Triggered Publish Packages for ${releaseTag}.`));
 }
 
 async function promptTarget() {
-  const answer = await ask(`Select release target:
-  1. Node packages / MCP
-  2. Agents
-  3. App distribution
-Choice [1]: `);
+  const packageStatus = getPackageReleaseStatus();
+  const agentStatus = getAgentReleaseStatus(getLatestAgentTag());
+  const answer = await ask(`${bold("Select release target:")}
+  ${cyan("1")}. Node packages / MCP (${formatStatusSummary(packageStatus)})
+  ${cyan("2")}. Agents (${formatStatusSummary(agentStatus)})
+  ${cyan("3")}. App distribution
+${dim("Choice")} [1]: `);
 
   const normalized = answer.trim().toLowerCase();
   if (!normalized || normalized === "1" || normalized === "packages" || normalized === "mcp") return "packages";
@@ -171,7 +231,7 @@ async function confirmOrExit(message) {
 
   const answer = await ask(message);
   if (!["y", "yes"].includes(answer.trim().toLowerCase())) {
-    console.log("Cancelled.");
+    console.log(dim("Cancelled."));
     process.exit(0);
   }
 }
@@ -208,6 +268,27 @@ function getLatestPackageVersion() {
   return uniqueVersions[0];
 }
 
+function getPackageReleaseStatus() {
+  const latest = getLatestSemverTag(PACKAGE_TAG_PREFIX);
+  if (!latest) {
+    return {
+      needed: true,
+      baseline: "no packages-v* tag",
+      latestVersion: getLatestPackageVersion(),
+      changedFiles: [],
+      reason: "No previous package release tag was found.",
+    };
+  }
+
+  const changedFiles = getChangedFilesSince(latest.tag, PACKAGE_RELEASE_PATHS);
+  return {
+    needed: changedFiles.length > 0,
+    baseline: latest.tag,
+    latestVersion: latest.versionText,
+    changedFiles,
+  };
+}
+
 function getLatestAgentTag() {
   const tag = getLatestSemverTag(AGENT_TAG_PREFIX);
   if (tag) return { tag: tag.tag, source: "current repo" };
@@ -239,12 +320,61 @@ function getLatestAgentTag() {
   return { tag: `${AGENT_TAG_PREFIX}0.0.0`, source: "initial baseline" };
 }
 
+function getAgentReleaseStatus(latest = getLatestAgentTag()) {
+  if (!refExists(`refs/tags/${latest.tag}`)) {
+    return {
+      needed: true,
+      baseline: `${latest.tag} (${latest.source ?? "missing local tag"})`,
+      changedFiles: [],
+      reason: "No comparable local agents release tag was found.",
+    };
+  }
+
+  const changedFiles = getChangedFilesSince(latest.tag, AGENT_RELEASE_PATHS);
+  return {
+    needed: changedFiles.length > 0,
+    baseline: latest.tag,
+    changedFiles,
+  };
+}
+
 function getLatestAppTag() {
   const tag = getLatestSemverTag(APP_TAG_PREFIX);
   if (!tag) {
     fail("No v* app release tag was found.");
   }
   return { tag: tag.tag };
+}
+
+function getChangedFilesSince(ref, paths) {
+  const output = run("git", ["diff", "--name-only", `${ref}..HEAD`, "--", ...paths]).stdout.trim();
+  if (!output) return [];
+  return output.split(/\r?\n/).filter(Boolean);
+}
+
+function printReleaseStatus(status) {
+  console.log(kv("Release needed", status.needed ? "yes" : "no", status.needed ? yellow : green));
+  console.log(kv("Compared against", status.baseline, dim));
+  if (status.reason) {
+    console.log(kv("Reason", status.reason, dim));
+  }
+  if (status.changedFiles.length > 0) {
+    console.log(dim("Changed publish-relevant files:"));
+    for (const file of status.changedFiles.slice(0, 20)) {
+      console.log(`  ${dim("-")} ${file}`);
+    }
+    if (status.changedFiles.length > 20) {
+      console.log(dim(`  ... and ${status.changedFiles.length - 20} more`));
+    }
+  }
+}
+
+function formatStatusSummary(status) {
+  if (status.needed) {
+    const detail = status.changedFiles.length > 0 ? `${status.changedFiles.length} changed file${status.changedFiles.length === 1 ? "" : "s"}` : "release baseline missing";
+    return `${yellow("needs release")}, ${detail}`;
+  }
+  return `${green("no release needed")} since ${status.baseline}`;
 }
 
 function getLatestSemverTag(prefix) {
@@ -258,6 +388,15 @@ function getLatestSemverTag(prefix) {
 
   if (tags.length === 0) return null;
   return { ...tags[0], versionText: formatVersion(tags[0].version) };
+}
+
+function refExists(ref) {
+  const result = spawnSync("git", ["rev-parse", "-q", "--verify", ref], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    stdio: "pipe",
+  });
+  return result.status === 0;
 }
 
 function resolveAgentTag(bump, latestTag) {
@@ -380,7 +519,7 @@ function escapeRegExp(value) {
 }
 
 function fail(message) {
-  console.error(message);
+  console.error(red(message));
   process.exit(1);
 }
 
@@ -407,6 +546,7 @@ Options:
   --dry-run             Print the release command without triggering it
   -y, --yes             Skip the confirmation prompt
   --skip-fetch          Do not run git fetch --tags before reading release tags
+  --force               Allow a package/agent release even when no relevant files changed
   -h, --help            Show this help
 `);
 }

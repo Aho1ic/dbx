@@ -11,7 +11,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
-use tokio::process::Command;
 use tokio::sync::Notify;
 
 const DEFAULT_CODEX_MODELS: &[&str] = &["default", "gpt-5.5", "gpt-5.4-mini"];
@@ -101,14 +100,29 @@ async fn resolve_program_path(program: &str) -> Option<String> {
 
 fn direct_program_path(program: &str) -> Option<String> {
     let path = Path::new(program);
-    if path.is_absolute() && path.is_file() {
+    if !path.is_absolute() {
+        return None;
+    }
+
+    if path.is_dir() {
+        return launchable_program_in_dir(path, "codex");
+    }
+
+    if path.is_file() {
         #[cfg(windows)]
         return windows_launchable_program_path(path);
         #[cfg(not(windows))]
         return Some(path.to_string_lossy().to_string());
-    } else {
-        None
     }
+
+    None
+}
+
+fn launchable_program_in_dir(dir: &Path, program: &str) -> Option<String> {
+    program_path_candidates(dir, program)
+        .into_iter()
+        .find(|candidate| is_launchable_program_path(candidate) && candidate.is_file())
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 #[cfg(windows)]
@@ -171,7 +185,7 @@ fn program_path_candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
 #[cfg(not(windows))]
 async fn shell_program_path(program: &str) -> Option<String> {
     let script = shell_resolve_script(program);
-    let mut command = Command::new(user_shell());
+    let mut command = cli_command(user_shell());
     command.args(user_shell_args(&script));
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let output = command.output().await.ok()?;
@@ -189,7 +203,7 @@ async fn shell_program_path(program: &str) -> Option<String> {
 #[cfg(windows)]
 async fn shell_program_path(program: &str) -> Option<String> {
     let script = format!("(Get-Command -All {} -ErrorAction SilentlyContinue).Source", windows_shell_quote(program));
-    let mut command = Command::new("powershell.exe");
+    let mut command = cli_command("powershell.exe");
     command.args(["-NoProfile", "-Command", &script]);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let output = command.output().await.ok()?;
@@ -313,6 +327,13 @@ fn validate_codex_program(config: &AiConfig) -> Result<String, String> {
     if starts_with_env_assignment(&program) {
         return Err("[codexCliPathInvalid] Codex CLI path should contain only the executable path. Add environment variables in the Codex CLI environment variables section.".to_string());
     }
+    if is_path_like_program(&program) {
+        let expanded = expand_tilde(&program);
+        let path = Path::new(&expanded);
+        if path.is_dir() && direct_program_path(&expanded).is_none() {
+            return Err("[codexCliPathInvalid] Codex CLI path should point to the Codex executable or a directory containing codex.".to_string());
+        }
+    }
     Ok(program)
 }
 
@@ -387,7 +408,7 @@ fn codex_mcp_config_overrides(options: &CodexRunOptions) -> Vec<String> {
     overrides
 }
 
-pub fn build_codex_exec_command(config: &AiConfig, prompt: &str, options: &CodexRunOptions) -> CodexCommandSpec {
+pub fn build_codex_exec_command(config: &AiConfig, _prompt: &str, options: &CodexRunOptions) -> CodexCommandSpec {
     let mut args = vec![
         "exec".to_string(),
         "--json".to_string(),
@@ -407,13 +428,13 @@ pub fn build_codex_exec_command(config: &AiConfig, prompt: &str, options: &Codex
         args.push(model.to_string());
     }
 
-    args.push(prompt.to_string());
+    args.push("-".to_string());
 
     CodexCommandSpec { program: codex_program(config), args }
 }
 
-pub fn build_codex_prompt(system_prompt: &str, messages: &[crate::ai::AiMessage]) -> String {
-    build_cli_agent_prompt("Codex", system_prompt, messages)
+pub fn build_codex_prompt(system_prompt: &str, messages: &[crate::ai::AiMessage], allow_write_sql: bool) -> String {
+    build_cli_agent_prompt("Codex", system_prompt, messages, allow_write_sql)
 }
 
 pub async fn list_codex_models(config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
@@ -497,9 +518,20 @@ fn classify_codex_spawn_error(message: &str) -> String {
     if message.contains("No such file") || message.contains("not found") {
         "[codexNotInstalled] Codex CLI was not found. Install Codex CLI or set the Codex CLI path in DBX AI settings."
             .to_string()
+    } else if is_command_line_too_long_error(message) {
+        "[codexCommandLineTooLong] Codex CLI command line is too long. Update DBX so Codex prompts are sent through stdin instead of process arguments."
+            .to_string()
     } else {
         format!("[codexRunFailed] Failed to start Codex CLI: {message}")
     }
+}
+
+fn is_command_line_too_long_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    message.contains("os error 206")
+        || message.contains("文件名或扩展名太长")
+        || lower.contains("filename or extension is too long")
+        || lower.contains("the filename or extension is too long")
 }
 
 fn classify_codex_run_error(stderr: &str) -> String {
@@ -536,6 +568,7 @@ pub async fn run_codex_agent(
         CliAgentProcessSpec {
             command,
             env,
+            stdin: Some(prompt.to_string()),
             dialect: CliAgentJsonlDialect::CodexExec,
             classify_spawn_error: classify_codex_spawn_error,
             classify_run_error: classify_codex_run_error,
@@ -551,14 +584,15 @@ mod tests {
     #[cfg(not(windows))]
     use super::shell_quote;
     use super::{
-        build_codex_exec_command, codex_cli_env, codex_enabled_tools, is_path_like_program, parse_codex_jsonl_event,
-        parse_codex_models, validate_codex_program, CodexRunOptions, DEFAULT_CODEX_MODELS,
+        build_codex_exec_command, classify_codex_spawn_error, codex_cli_env, codex_enabled_tools, is_path_like_program,
+        parse_codex_jsonl_event, parse_codex_models, validate_codex_program, CodexRunOptions, DEFAULT_CODEX_MODELS,
     };
     #[cfg(not(windows))]
     use super::{codex_process_env, common_executable_dirs, merged_path_with_dir};
     #[cfg(windows)]
     use super::{
-        direct_program_path, first_windows_program_path, program_path_candidates, windows_npm_codex_shim_command,
+        direct_program_path, first_windows_program_path, program_path_candidates, resolve_codex_command,
+        windows_npm_codex_shim_command,
     };
     use crate::agent_events::AgentEvent;
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiProvider, AiReasoningLevel};
@@ -588,6 +622,8 @@ mod tests {
             connection_name: "local".to_string(),
             database: "demo".to_string(),
             agent_mode: true,
+            allow_writes: false,
+            allow_dangerous: false,
             mcp_server_command: None,
         }
     }
@@ -598,11 +634,14 @@ mod tests {
 
         assert_eq!(spec.program, "codex");
         assert!(spec.args.contains(&"--json".to_string()));
+        assert_eq!(spec.args.last().map(String::as_str), Some("-"));
+        assert!(!spec.args.contains(&"hello".to_string()));
         assert!(!spec.args.contains(&"--model".to_string()));
         assert!(!spec.args.contains(&"--ask-for-approval".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.command=\"dbx-mcp-server\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.default_tools_approval_mode=\"approve\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_ALLOW_WRITES=\"0\"".to_string()));
+        assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_ALLOW_DANGEROUS_SQL=\"0\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_SCOPE_CONNECTION_ID=\"conn-1\"".to_string()));
         assert!(spec.args.iter().any(|arg| arg.contains("dbx_execute_query")));
     }
@@ -710,6 +749,50 @@ mod tests {
         assert!(resolved.is_none());
         let _ = std::fs::remove_file(extensionless);
         let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_direct_directory_path_uses_codex_cmd_inside() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-direct-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        let cmd = dir.join("codex.cmd");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, "@echo off\n").unwrap();
+
+        let resolved = direct_program_path(dir.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(resolved, cmd.to_string_lossy().as_ref());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn windows_configured_nvm_directory_resolves_codex_cmd_shim() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-nvm-dir-test-{}", std::process::id()));
+        let bin_dir = dir.join("node_modules").join("@openai").join("codex").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let cmd = dir.join("codex.cmd");
+        let node = dir.join("node.exe");
+        let codex_js = bin_dir.join("codex.js");
+        std::fs::write(&cmd, "@echo off\nnode codex.js %*\n").unwrap();
+        std::fs::write(&node, "").unwrap();
+        std::fs::write(&codex_js, "#!/usr/bin/env node\n").unwrap();
+
+        let mut config = codex_config("default");
+        config.codex_cli_path = Some(dir.to_string_lossy().to_string());
+
+        let command = resolve_codex_command(&config).await;
+
+        assert_eq!(command.program, node.to_string_lossy().as_ref());
+        assert_eq!(command.args, vec![codex_js.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_file(node);
+        let _ = std::fs::remove_file(codex_js);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -845,6 +928,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_directory_without_codex_in_codex_cli_path() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-empty-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = codex_config("default");
+        config.codex_cli_path = Some(dir.to_string_lossy().to_string());
+
+        let err = validate_codex_program(&config).unwrap_err();
+
+        assert!(err.contains("[codexCliPathInvalid]"));
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
     fn parses_codex_model_catalog_without_service_tiers() {
         let models = parse_codex_models(
             r#"{"models":[{"slug":"gpt-5.5","display_name":"GPT-5.5","service_tiers":[{"id":"priority","name":"Priority"}]},{"slug":"gpt-5.4-mini","display_name":"GPT-5.4 mini"}]}"#,
@@ -857,6 +953,13 @@ mod tests {
         );
         assert_eq!(models[1].display_name.as_deref(), Some("GPT-5.5"));
         assert!(!models.iter().any(|model| model.id == "priority" || model.id == "Priority"));
+    }
+
+    #[test]
+    fn classifies_windows_command_line_too_long_spawn_error() {
+        let err = classify_codex_spawn_error("文件名或扩展名太长。 (os error 206)");
+
+        assert!(err.contains("[codexCommandLineTooLong]"));
     }
 
     #[test]

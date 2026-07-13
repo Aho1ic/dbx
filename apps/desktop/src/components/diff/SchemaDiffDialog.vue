@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import { GitCompareArrows, ArrowLeft, Play, Loader2, Maximize2, Minimize2, AlertTriangle, CircleCheck } from "@lucide/vue";
-import * as api from "@/lib/api";
+import * as api from "@/lib/backend/api";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { useSchemaDiffConfig } from "@/composables/useSchemaDiffConfig";
 import SchemaDiffConfigStep from "@/components/diff/SchemaDiffConfigStep.vue";
 import SchemaDiffObjectTree from "@/components/diff/SchemaDiffObjectTree.vue";
@@ -14,12 +15,13 @@ import SchemaDiffDdlPanel from "@/components/diff/SchemaDiffDdlPanel.vue";
 import SchemaDiffDeployStep from "@/components/diff/SchemaDiffDeployStep.vue";
 import SchemaDiffOptionsPanel from "@/components/diff/SchemaDiffOptionsPanel.vue";
 
-import { getSchemaDiffOptionsForDbType } from "@/lib/schemaDiffOptions";
+import { getSchemaDiffOptionsForDbType } from "@/lib/schema/schemaDiffOptions";
+import { createConcurrencyLimiter, mapWithConcurrency, schemaDiffMetadataConcurrency } from "@/lib/schema/schemaDiffMetadataLoad";
 import { normalizeSchemaDiffCompareOptions } from "@/types/schemaDiff";
 import type { SchemaDiffCompareOptions, SchemaDiffConfig } from "@/types/schemaDiff";
-import type { ObjectSourceKind } from "@/types/database";
-import { buildDeploySqlForObjects, convertToSchemaDiffObjects, groupDiffObjects, type OperationGroup, type SchemaDiffObject, type DiffOperationType, type DiffObjectKind, type SchemaDiffPreparation } from "@/lib/schemaDiff";
-import { compileSchemaDiffTableFilter, filterSchemaDiffTables } from "@/lib/schemaDiffTableFilter";
+import type { ObjectSourceKind, TableInfo } from "@/types/database";
+import { buildDeploySqlForObjects, convertToSchemaDiffObjects, groupDiffObjects, schemaDiffDeployTargetSchema, type OperationGroup, type SchemaDiffObject, type DiffOperationType, type DiffObjectKind, type SchemaDiffPreparation, type TableSchemaDetail } from "@/lib/schema/schemaDiff";
+import { compileSchemaDiffTableFilter, filterSchemaDiffTables } from "@/lib/schema/schemaDiffTableFilter";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 
@@ -279,13 +281,45 @@ function isViewOrMaterializedView(tableType: string): ObjectSourceKind | undefin
   }
 }
 
+interface SchemaDetailLoadContext {
+  connectionId: string;
+  database: string;
+  schema: string;
+  dbType: string;
+  options: SchemaDiffCompareOptions;
+}
+
+function shouldLoadIndexes(options: SchemaDiffCompareOptions): boolean {
+  return options.indexes || options.primaryKeys || options.uniqueKeys;
+}
+
+async function loadSchemaDetails(tables: TableInfo[], context: SchemaDetailLoadContext): Promise<TableSchemaDetail[]> {
+  const concurrency = schemaDiffMetadataConcurrency(context.dbType, tables.length);
+  const runMetadataQuery = createConcurrencyLimiter(concurrency);
+
+  return mapWithConcurrency(tables, concurrency, async (table) => {
+    const objectType = isViewOrMaterializedView(table.table_type);
+    const [columns, indexes, foreignKeys, triggers, ddl] = await Promise.all([
+      runMetadataQuery(() => api.getColumns(context.connectionId, context.database, context.schema, table.name)),
+      shouldLoadIndexes(context.options) ? runMetadataQuery(() => api.listIndexes(context.connectionId, context.database, context.schema, table.name)) : Promise.resolve([]),
+      context.options.foreignKeys ? runMetadataQuery(() => api.listForeignKeys(context.connectionId, context.database, context.schema, table.name)) : Promise.resolve([]),
+      context.options.triggers ? runMetadataQuery(() => api.listTriggers(context.connectionId, context.database, context.schema, table.name)) : Promise.resolve([]),
+      runMetadataQuery(() => api.getTableDdl(context.connectionId, context.database, context.schema, table.name, objectType)),
+    ]);
+
+    return { name: table.name, columns, indexes, foreignKeys, triggers, ddl };
+  });
+}
+
 async function handleCompare() {
   loading.value = true;
   step.value = "compare";
 
   try {
+    const sourceConfig = store.getConfig(sourceConnectionId.value);
     const targetConfig = store.getConfig(targetConnectionId.value);
     const dbType = targetConfig?.db_type || "mysql";
+    const sourceDbType = sourceConfig?.db_type || dbType;
     const opts = normalizeSchemaDiffCompareOptions(activeConfig.value?.options, dbType);
     const tableFilter = compileSchemaDiffTableFilter(opts);
 
@@ -295,34 +329,21 @@ async function handleCompare() {
     const [srcTables, tgtTables] = await Promise.all([api.listTables(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value), api.listTables(targetConnectionId.value, targetDatabase.value, targetSchema.value)]);
     const { sourceTables, targetTables } = filterSchemaDiffTables(srcTables, tgtTables, tableFilter);
 
-    // Load schema details in parallel
-    const sourceDetails = await Promise.all(
-      sourceTables.map(async (table) => {
-        const objectType = isViewOrMaterializedView(table.table_type);
-        const [columns, indexes, foreignKeys, triggers, ddl] = await Promise.all([
-          api.getColumns(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, table.name),
-          api.listIndexes(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, table.name),
-          api.listForeignKeys(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, table.name),
-          api.listTriggers(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, table.name),
-          api.getTableDdl(sourceConnectionId.value, sourceDatabase.value, sourceSchema.value, table.name, objectType),
-        ]);
-        return { name: table.name, columns, indexes, foreignKeys, triggers, ddl };
-      }),
-    );
+    const sourceDetails = await loadSchemaDetails(sourceTables, {
+      connectionId: sourceConnectionId.value,
+      database: sourceDatabase.value,
+      schema: sourceSchema.value,
+      dbType: sourceDbType,
+      options: opts,
+    });
 
-    const targetDetails = await Promise.all(
-      targetTables.map(async (table) => {
-        const objectType = isViewOrMaterializedView(table.table_type);
-        const [columns, indexes, foreignKeys, triggers, ddl] = await Promise.all([
-          api.getColumns(targetConnectionId.value, targetDatabase.value, targetSchema.value, table.name),
-          api.listIndexes(targetConnectionId.value, targetDatabase.value, targetSchema.value, table.name),
-          api.listForeignKeys(targetConnectionId.value, targetDatabase.value, targetSchema.value, table.name),
-          api.listTriggers(targetConnectionId.value, targetDatabase.value, targetSchema.value, table.name),
-          api.getTableDdl(targetConnectionId.value, targetDatabase.value, targetSchema.value, table.name, objectType),
-        ]);
-        return { name: table.name, columns, indexes, foreignKeys, triggers, ddl };
-      }),
-    );
+    const targetDetails = await loadSchemaDetails(targetTables, {
+      connectionId: targetConnectionId.value,
+      database: targetDatabase.value,
+      schema: targetSchema.value,
+      dbType,
+      options: opts,
+    });
 
     const isPostgresLike = dbType === "postgres" || dbType === "opengauss";
 
@@ -370,7 +391,7 @@ async function handleCompare() {
       sourceOwners: srcOwners,
       targetOwners: tgtOwners,
       databaseType: dbType,
-      targetSchema: targetSchema.value,
+      targetSchema: schemaDiffDeployTargetSchema(dbType, targetDatabase.value, targetSchema.value),
       ignoreComments: ignoreComments.value,
       cascadeDelete: opts?.cascadeDelete ?? false,
       compareColumnOrder: opts.compareColumnOrder,
@@ -476,7 +497,14 @@ async function handleExecuteScript() {
 
   executing.value = true;
   try {
-    await api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value);
+    const result = await executeWithProductionSqlGuard({
+      connection: store.getConfig(targetConnectionId.value),
+      database: targetDatabase.value,
+      sql: deploySql.value,
+      source: t("production.sourceSchemaDiff"),
+      execute: () => api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value),
+    });
+    if (!result) return;
     toast(t("diff.executeSuccess"), 3000);
   } catch (e: any) {
     toast(e?.message || String(e), 5000);
@@ -601,7 +629,14 @@ async function onConfirmDeploy() {
   showConfirmDialog.value = false;
   executing.value = true;
   try {
-    const result = await api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value);
+    const result = await executeWithProductionSqlGuard({
+      connection: store.getConfig(targetConnectionId.value),
+      database: targetDatabase.value,
+      sql: deploySql.value,
+      source: t("production.sourceSchemaDiff"),
+      execute: () => api.executeScript(targetConnectionId.value, targetDatabase.value, deploySql.value, targetSchema.value),
+    });
+    if (!result) return;
     deployResult.value = {
       success: true,
       message: t("diff.deploySuccess"),

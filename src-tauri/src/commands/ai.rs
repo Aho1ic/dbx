@@ -28,6 +28,26 @@ pub async fn load_ai_config(state: State<'_, Arc<AppState>>) -> Result<Option<Ai
 }
 
 #[tauri::command]
+pub async fn save_ai_provider_config(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+    config: AiConfig,
+) -> Result<(), String> {
+    let parsed_provider: AiProvider = serde_json::from_value(serde_json::Value::String(provider.clone()))
+        .map_err(|_| format!("Invalid AI provider: {provider}"))?;
+    let mut config = config;
+    config.provider = parsed_provider;
+    state.storage.save_ai_provider_config(&provider, &config).await
+}
+
+#[tauri::command]
+pub async fn load_ai_provider_configs(
+    state: State<'_, Arc<AppState>>,
+) -> Result<std::collections::HashMap<String, AiConfig>, String> {
+    state.storage.load_ai_provider_configs().await
+}
+
+#[tauri::command]
 pub async fn ai_complete(request: AiCompletionRequest) -> Result<String, String> {
     dbx_core::ai::complete(&request).await
 }
@@ -66,6 +86,7 @@ pub async fn ai_agent_stream(
     database: String,
     db_type: String,
     mode: Option<String>,
+    allow_write_sql: Option<bool>,
 ) -> Result<String, String> {
     let request = resolve_codex_cli_request(request);
     let cancelled = dbx_core::ai::register_stream(&session_id).await;
@@ -78,12 +99,23 @@ pub async fn ai_agent_stream(
     } else {
         None
     };
+    let production_database = state
+        .configs
+        .read()
+        .await
+        .get(&connection_id)
+        .is_some_and(|config| dbx_core::production_safety::is_production_database(config, &database));
     let agent_ctx = AgentLoopContext {
         state: state.inner().clone(),
         connection_id,
         database,
         db_type: parsed_db_type,
         cli_mcp_server_command,
+        // Explicit confirmation grants write access only to this agent run, never to production.
+        sql_permissions: dbx_core::agent_tools::AgentSqlPermissions {
+            allow_writes: !production_database && allow_write_sql.unwrap_or(false),
+            allow_dangerous: !production_database && allow_write_sql.unwrap_or(false),
+        },
     };
     let is_agent_mode = mode.as_deref() == Some("agent");
 
@@ -100,7 +132,6 @@ pub async fn ai_agent_stream(
         },
         &cancelled,
         request.max_tokens,
-        request.temperature,
         request.task_contract.as_ref(),
         is_agent_mode,
     )

@@ -104,6 +104,7 @@ pub async fn list_objects(pool: &mysql_async::Pool, schema: &str) -> Result<Vec<
             name: get_str(row, 0),
             object_type: get_str(row, 1),
             schema: Some(schema.to_string()),
+            signature: None,
             comment: None,
             created_at: None,
             updated_at: None,
@@ -153,6 +154,8 @@ pub async fn get_columns(pool: &mysql_async::Pool, schema: &str, table: &str) ->
                 numeric_precision: precision,
                 numeric_scale: scale,
                 character_maximum_length: length,
+                enum_values: None,
+                ..Default::default()
             }
         })
         .collect())

@@ -4,8 +4,8 @@ import { useI18n } from "vue-i18n";
 import { TableProperties, ListTree, KeyRound, Link2, RotateCcw, Code2, Copy, WrapText, Loader2, Search, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import type { ColumnInfo, ForeignKeyInfo, IndexInfo, QueryTab, TriggerInfo } from "@/types/database";
-import * as api from "@/lib/api";
-import { copyToClipboard } from "@/lib/clipboard";
+import * as api from "@/lib/backend/api";
+import { copyToClipboard } from "@/lib/common/clipboard";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 
 type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
@@ -73,11 +73,18 @@ async function selectTab(tab: TableInfoTab) {
   else if (tab === "triggers") await fetchTriggers();
 }
 
+watch(
+  () => props.tab.tableInfoActiveTab,
+  (tab) => {
+    if (tab && tab !== activeTab.value) void selectTab(tab);
+  },
+);
+
 async function fetchDdl() {
   if (!props.tab.connectionId || !target.value) return;
   ddlLoading.value = true;
   try {
-    ddlContent.value = await api.getTableDdl(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName);
+    ddlContent.value = await api.getTableDdl(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName, undefined, target.value.catalog);
   } catch (e: any) {
     ddlContent.value = `-- Error: ${e}`;
   } finally {
@@ -90,7 +97,7 @@ async function fetchIndexes() {
   indexesLoading.value = true;
   indexesError.value = "";
   try {
-    indexes.value = await api.listIndexes(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName);
+    indexes.value = await api.listIndexes(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName, target.value.catalog);
     indexesLoaded.value = true;
   } catch (e: any) {
     indexesError.value = String(e?.message || e);
@@ -104,7 +111,7 @@ async function fetchForeignKeys() {
   foreignKeysLoading.value = true;
   foreignKeysError.value = "";
   try {
-    foreignKeys.value = await api.listForeignKeys(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName);
+    foreignKeys.value = await api.listForeignKeys(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName, target.value.catalog);
     foreignKeysLoaded.value = true;
   } catch (e: any) {
     foreignKeysError.value = String(e?.message || e);
@@ -118,7 +125,7 @@ async function fetchTriggers() {
   triggersLoading.value = true;
   triggersError.value = "";
   try {
-    triggers.value = await api.listTriggers(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName);
+    triggers.value = await api.listTriggers(props.tab.connectionId, props.tab.database || "", target.value.schema || props.tab.database || "", target.value.tableName, target.value.catalog);
     triggersLoaded.value = true;
   } catch (e: any) {
     triggersError.value = String(e?.message || e);

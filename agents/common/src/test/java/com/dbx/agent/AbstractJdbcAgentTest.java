@@ -67,7 +67,7 @@ class AbstractJdbcAgentTest {
         assertEquals(Collections.singletonList("VALUE"), result.getColumns());
         assertEquals(Collections.singletonList(Collections.<Object>singletonList("row-value")), result.getRows());
         assertFalse(result.getTruncated());
-        assertEquals(Arrays.asList("setSchema:APP", "setMaxRows:26", "setFetchSize:7", "execute:SELECT VALUE"), tracking.calls);
+        assertEquals(Arrays.asList("execute:USE APP", "setMaxRows:26", "setFetchSize:7", "execute:SELECT VALUE"), tracking.calls);
     }
 
     @Test
@@ -104,6 +104,44 @@ class AbstractJdbcAgentTest {
     }
 
     @Test
+    void executesTransactionControlSqlThroughStatements() {
+        TrackingConnection tracking = new TrackingConnection();
+        TestAgent agent = new TestAgent(tracking);
+        agent.connect(new ConnectParams());
+
+        // Dump files can contain explicit transaction SQL while the JDBC connection is in auto-commit mode.
+        agent.executeQuery("BEGIN;", null, new ExecuteQueryOptions());
+        agent.executeQuery("BEGIN TRANSACTION;", null, new ExecuteQueryOptions());
+        agent.executeQuery("COMMIT;", null, new ExecuteQueryOptions());
+        agent.executeQuery("ROLLBACK;", null, new ExecuteQueryOptions());
+
+        assertEquals(
+            Arrays.asList(
+                "setMaxRows:10001",
+                "execute:BEGIN",
+                "setMaxRows:10001",
+                "execute:BEGIN TRANSACTION",
+                "setMaxRows:10001",
+                "execute:COMMIT",
+                "setMaxRows:10001",
+                "execute:ROLLBACK"
+            ),
+            tracking.calls
+        );
+    }
+
+    @Test
+    void executesPagedTransactionControlSqlThroughStatements() {
+        TrackingConnection tracking = new TrackingConnection();
+        TestAgent agent = new TestAgent(tracking);
+        agent.connect(new ConnectParams());
+
+        agent.executeQueryPage("COMMIT;", null, new QueryPageOptions());
+
+        assertEquals(Collections.singletonList("execute:COMMIT"), tracking.calls);
+    }
+
+    @Test
     void delegatesTransactionsThroughSharedFoundation() {
         TrackingConnection tracking = new TrackingConnection();
         TestAgent agent = new TestAgent(tracking);
@@ -115,7 +153,7 @@ class AbstractJdbcAgentTest {
         assertEquals(
             Arrays.asList(
                 "setAutoCommit:false",
-                "setSchema:APP",
+                "execute:USE APP",
                 "executeUpdate:UPDATE A",
                 "executeUpdate:UPDATE B",
                 "commit",

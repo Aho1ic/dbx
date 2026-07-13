@@ -4,6 +4,7 @@ use dbx_core::database_capabilities::{
 };
 use dbx_core::models::connection::DatabaseType;
 use serde::Deserialize;
+use std::collections::HashSet;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,7 +82,6 @@ impl DriverProductCapabilities {
 #[serde(rename_all = "camelCase")]
 struct DriverProfileEntry {
     profile: String,
-    label: String,
     agent_key: String,
 }
 
@@ -115,7 +115,22 @@ fn maps_agent_database_types_to_driver_keys() {
     assert_eq!(agent_key(&DatabaseType::ZooKeeper, None), Some("zookeeper"));
     assert_eq!(agent_key(&DatabaseType::Oracle, Some("oracle-legacy")), Some("oracle"));
     assert_eq!(agent_key(&DatabaseType::Oracle, Some("oracle-10g")), Some("oracle"));
+    assert_eq!(agent_key(&DatabaseType::SqlServer, Some("sqlserver-legacy")), Some("sqlserver-legacy"));
+    assert_eq!(agent_key(&DatabaseType::SqlServer, None), None);
     assert_eq!(agent_key(&DatabaseType::Postgres, None), None);
+}
+
+#[test]
+fn driver_store_entries_do_not_repeat_agent_keys() {
+    let entries: Vec<_> = agent_catalog::driver_store_entries().collect();
+    let mut seen = HashSet::new();
+    let duplicate_keys: Vec<_> = entries.iter().map(|(key, _)| *key).filter(|key| !seen.insert(*key)).collect();
+
+    assert!(duplicate_keys.is_empty(), "driver store agent keys should be unique: {duplicate_keys:?}");
+    assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8a").count(), 1);
+    assert_eq!(entries.iter().filter(|(key, _)| *key == "gbase8s").count(), 1);
+    assert_eq!(entries.iter().filter(|(key, _)| *key == "sqlserver-legacy").count(), 1);
+    assert_eq!(agent_catalog::label_for_key("sqlserver-legacy"), Some("SQL Server legacy compatibility component"));
 }
 
 #[test]
@@ -310,4 +325,17 @@ fn driver_manifest_declares_expected_product_capabilities() {
     assert!(zookeeper.capabilities.query_execution);
     assert!(zookeeper.capabilities.driver_management);
     assert!(!zookeeper.capabilities.metadata_browse);
+}
+
+#[test]
+fn kingbase_declares_data_transfer_support() {
+    let manifest = driver_manifest();
+    let kingbase = manifest
+        .drivers
+        .iter()
+        .find(|driver| driver.db_type == DatabaseType::Kingbase)
+        .expect("Kingbase manifest entry");
+
+    assert!(kingbase.capabilities.table_import);
+    assert!(kingbase.capabilities.data_transfer);
 }

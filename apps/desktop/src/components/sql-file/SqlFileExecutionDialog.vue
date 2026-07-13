@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { uuid } from "@/lib/utils";
+import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { Dialog, DialogFooter, DialogHeader, DialogScrollContent, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,8 +12,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import { useToast } from "@/composables/useToast";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
+import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { databaseOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { cancelSqlFileExecution, executeSqlFile, listenSqlFileProgress, listDatabases, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus } from "@/lib/api";
+import { requiresSqlFileTargetDatabaseSelection } from "@/lib/connection/connectionLevelDatabaseBootstrap";
+import { cancelSqlFileExecution, executeSqlFile, listenSqlFileProgress, listDatabases, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus } from "@/lib/backend/api";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { Check, CheckSquare, FileCode, FolderOpen, Loader2, Play, Square, X } from "@lucide/vue";
 
@@ -26,9 +29,11 @@ const open = defineModel<boolean>("open", { default: false });
 const props = defineProps<{
   prefillConnectionId?: string;
   prefillDatabase?: string;
+  prefillFilePath?: string;
 }>();
 
 const store = useConnectionStore();
+const productionSafetyStore = useProductionSafetyStore();
 
 const fileInput = ref<HTMLInputElement | null>(null);
 const filePath = ref("");
@@ -55,7 +60,11 @@ const sqlConnections = computed(() => store.connections.filter((c) => !["redis",
 
 const selectedConnection = computed(() => sqlConnections.value.find((c) => c.id === connectionId.value));
 
-const canStart = computed(() => Boolean(preview.value && selectedConnection.value && database.value.trim() && !running.value && !loadingPreview.value && !loadingDatabases.value));
+const canStart = computed(() => {
+  const connection = selectedConnection.value;
+  if (!preview.value || !connection || running.value || loadingPreview.value || loadingDatabases.value) return false;
+  return !!database.value.trim() || !requiresSqlFileTargetDatabaseSelection(connection, preview.value.canExecuteWithoutSelectedDatabase);
+});
 
 const statusTone = computed(() => {
   if (terminalStatus.value === "done") return "text-green-600";
@@ -200,7 +209,7 @@ async function previewSelectedSqlFile(fileOrPath: string | File) {
   if (isTauriRuntime()) {
     return previewSqlFile(fileOrPath as string);
   }
-  const { previewSqlFile: previewWebSqlFile } = await import("@/lib/http");
+  const { previewSqlFile: previewWebSqlFile } = await import("@/lib/backend/http");
   return previewWebSqlFile(fileOrPath as File);
 }
 
@@ -258,7 +267,7 @@ async function listenProgress(id: string, handler: (next: SqlFileProgress) => vo
   if (isTauriRuntime()) {
     return listenSqlFileProgress(handler);
   }
-  const { listenSqlFileProgressById } = await import("@/lib/httpSqlFileProgress");
+  const { listenSqlFileProgressById } = await import("@/lib/sql/httpSqlFileProgress");
   return listenSqlFileProgressById(id, handler);
 }
 
@@ -274,6 +283,18 @@ async function refreshTargetAfterImport() {
 
 async function startExecution() {
   if (!canStart.value || !preview.value) return;
+  const productionContext = productionContextForDatabase(selectedConnection.value, database.value);
+  if (productionContext.active) {
+    // File previews are truncated, so production file execution is always reviewed instead of inferring safety from a partial preview.
+    const confirmed = await productionSafetyStore.requestConfirmation({
+      sql: preview.value.preview,
+      connectionName: selectedConnection.value?.name,
+      database: database.value,
+      productionDatabases: productionContext.databases,
+      source: t("production.sourceSqlFile"),
+    });
+    if (!confirmed) return;
+  }
 
   const id = uuid();
   executionId.value = id;
@@ -404,6 +425,11 @@ watch(
     resetState();
     if (connectionId.value) {
       loadDatabasesForConnection(connectionId.value);
+    }
+    // When opened from the SQL Files panel with a pre-selected file, load its
+    // preview automatically so the user can review statements before running.
+    if (props.prefillFilePath) {
+      void loadPreview(props.prefillFilePath);
     }
   },
   { immediate: true },

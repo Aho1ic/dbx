@@ -4,8 +4,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use tokio::sync::RwLock;
 
+use crate::connection::task_client_session_id;
 use crate::models::connection::DatabaseType;
-use crate::sql_dialect::{qualified_table_name, quote_table_identifier};
+use crate::object_source_sql::build_export_object_source_sql;
+use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_single_row_insert_statements};
 use crate::transfer::{
     format_ch_array_sql_literal, format_pg_array_sql_literal, is_identity_column_extra, quote_identifier,
     selected_columns_include_identity_extras, wrap_dameng_identity_insert_sql,
@@ -14,6 +16,10 @@ use crate::transfer::{
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
+
+pub fn database_export_client_session_id(export_id: &str) -> String {
+    task_client_session_id("database-export", export_id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +160,10 @@ pub struct BuildDatabaseSqlExportOptions {
 }
 
 pub fn format_export_sql_literal(value: &Value) -> String {
+    format_export_sql_literal_for_database(value, None)
+}
+
+fn format_export_sql_literal_for_database(value: &Value, database_type: Option<DatabaseType>) -> String {
     if value.is_null() {
         return "NULL".to_string();
     }
@@ -167,7 +177,7 @@ pub fn format_export_sql_literal(value: &Value) -> String {
         return format_pg_array_sql_literal(arr);
     }
     let text = value.as_str().map_or_else(|| value.to_string(), ToString::to_string);
-    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+    quote_export_sql_string_for_database(&text, database_type)
 }
 
 fn format_export_sql_literal_typed(
@@ -175,15 +185,332 @@ fn format_export_sql_literal_typed(
     database_type: Option<DatabaseType>,
     column_type: Option<&str>,
 ) -> String {
+    if is_postgres_json_export_column(database_type, column_type) {
+        return format_postgres_json_export_literal(value);
+    }
+    if is_postgres_vector_export_column(database_type, column_type) {
+        return format_postgres_vector_export_literal(value);
+    }
     if matches!(database_type, Some(DatabaseType::Mysql)) && column_type.is_some_and(is_mysql_bit_type) {
         return format_mysql_bit_literal(value);
+    }
+    if is_mysql_compatible_export_literal_target(database_type) {
+        if column_type.is_some_and(is_mysql_binary_export_type) {
+            if let Some(literal) = format_mysql_binary_export_literal(value) {
+                return literal;
+            }
+        }
+        if column_type.is_some_and(is_export_numeric_type) {
+            if let Some(literal) = format_export_numeric_literal(value) {
+                return literal;
+            }
+        }
     }
     if let Some(arr) = value.as_array() {
         if matches!(database_type, Some(DatabaseType::ClickHouse) | Some(DatabaseType::Databend)) {
             return format_ch_array_sql_literal(arr);
         }
     }
-    format_export_sql_literal(value)
+    if let Some(literal) = format_oracle_export_date_literal(value, database_type, column_type) {
+        return literal;
+    }
+    if let Some(literal) = format_export_temporal_literal(value, database_type, column_type) {
+        return literal;
+    }
+    format_export_sql_literal_for_database(value, database_type)
+}
+
+fn format_postgres_json_export_literal(value: &Value) -> String {
+    if value.is_null() {
+        return "NULL".to_string();
+    }
+    let text = value.as_str().map_or_else(|| value.to_string(), ToString::to_string);
+    // PostgreSQL standard strings keep backslashes literal; JSON text needs its
+    // own escape sequences, so only SQL-escape the surrounding string delimiter.
+    postgres_string_literal(&text)
+}
+
+fn format_postgres_vector_export_literal(value: &Value) -> String {
+    if value.is_null() {
+        return "NULL".to_string();
+    }
+    let text = match value {
+        // pgvector vector/halfvec are scalar extension types whose importable
+        // literal grammar uses square brackets, unlike PostgreSQL arrays.
+        Value::Array(arr) => format_postgres_vector_export_text(arr),
+        Value::String(text) => text.to_string(),
+        _ => value.to_string(),
+    };
+    postgres_string_literal(&text)
+}
+
+fn format_postgres_vector_export_text(arr: &[Value]) -> String {
+    let elements = arr.iter().map(format_postgres_vector_export_element).collect::<Vec<_>>();
+    format!("[{}]", elements.join(","))
+}
+
+fn format_postgres_vector_export_element(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Null => "NULL".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn quote_export_sql_string(text: &str) -> String {
+    format!("'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
+}
+
+fn quote_export_sql_string_for_database(text: &str, database_type: Option<DatabaseType>) -> String {
+    if is_mysql_compatible_export_literal_target(database_type) {
+        quote_mysql_compatible_export_sql_string(text)
+    } else {
+        quote_export_sql_string(text)
+    }
+}
+
+fn quote_mysql_compatible_export_sql_string(text: &str) -> String {
+    format!("'{}'", escape_mysql_compatible_export_sql_string(text))
+}
+
+fn escape_mysql_compatible_export_sql_string(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            // MySQL-family dumps should keep control characters out of the
+            // physical script layout while relying on the dialect's escapes.
+            '\0' => escaped.push_str("\\0"),
+            '\x08' => escaped.push_str("\\b"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\x0c' => escaped.push_str("\\f"),
+            '\x1a' => escaped.push_str("\\Z"),
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("''"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn is_mysql_compatible_export_literal_target(database_type: Option<DatabaseType>) -> bool {
+    matches!(
+        database_type,
+        Some(DatabaseType::Mysql | DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::Goldendb)
+    )
+}
+
+fn format_oracle_export_date_literal(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+) -> Option<String> {
+    if !matches!(database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) {
+        return None;
+    }
+    if export_temporal_column_kind(database_type, column_type?)? != ExportTemporalKind::DateTime {
+        return None;
+    }
+    let lower = column_type?.trim().trim_matches('"').to_ascii_lowercase();
+    let base = lower.split(['(', ' ', '\t', '\n']).next().unwrap_or("");
+    if base != "date" {
+        return None;
+    }
+    let parts = parse_export_date_parts(value.as_str()?)?;
+    Some(format_oracle_export_date_parts_literal(&parts))
+}
+
+fn format_oracle_export_date_parts_literal(parts: &ExportRfc3339Parts) -> String {
+    if export_temporal_parts_are_midnight(parts) {
+        format!("DATE '{}'", parts.date)
+    } else {
+        format!("TO_DATE('{} {}', 'YYYY-MM-DD HH24:MI:SS')", parts.date, parts.time)
+    }
+}
+
+fn export_temporal_parts_are_midnight(parts: &ExportRfc3339Parts) -> bool {
+    parts.time == "00:00:00"
+        && parts
+            .fraction
+            .as_deref()
+            .map(|fraction| fraction.trim_start_matches('.').chars().all(|ch| ch == '0'))
+            .unwrap_or(true)
+}
+
+fn format_export_temporal_literal(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_type: Option<&str>,
+) -> Option<String> {
+    let text = value.as_str()?;
+    let column_type = column_type?;
+    if database_type == Some(DatabaseType::SqlServer) {
+        return crate::sqlserver_temporal::normalize_sqlserver_temporal_literal(text, Some(column_type))
+            .map(|text| quote_export_sql_string(&text));
+    }
+    let kind = export_temporal_column_kind(database_type, column_type)?;
+    format_rfc3339_export_temporal_text(text, kind, database_type).map(|text| quote_export_sql_string(&text))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportTemporalKind {
+    Date,
+    Time,
+    DateTime,
+    DateTimeWithTimeZone,
+}
+
+fn export_temporal_column_kind(database_type: Option<DatabaseType>, column_type: &str) -> Option<ExportTemporalKind> {
+    let lower = column_type.trim().trim_matches('"').to_ascii_lowercase();
+    let base = lower.split(['(', ' ', '\t', '\n']).next().unwrap_or("");
+    match base {
+        "date" if matches!(database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) => {
+            Some(ExportTemporalKind::DateTime)
+        }
+        "date" => Some(ExportTemporalKind::Date),
+        "time" => Some(ExportTemporalKind::Time),
+        "datetime" | "datetime2" | "smalldatetime" | "datetime64" => Some(ExportTemporalKind::DateTime),
+        "datetimeoffset" | "timestamptz" => Some(ExportTemporalKind::DateTimeWithTimeZone),
+        _ if lower.starts_with("timestamp")
+            && (lower.contains("with time zone") || lower.contains("with local time zone")) =>
+        {
+            Some(ExportTemporalKind::DateTimeWithTimeZone)
+        }
+        _ if lower.starts_with("timestamp") => Some(ExportTemporalKind::DateTime),
+        _ => None,
+    }
+}
+
+fn format_rfc3339_export_temporal_text(
+    text: &str,
+    kind: ExportTemporalKind,
+    database_type: Option<DatabaseType>,
+) -> Option<String> {
+    let parts = parse_export_rfc3339_parts(text)?;
+    let fraction = normalize_export_fraction(parts.fraction.as_deref(), database_type);
+    match kind {
+        ExportTemporalKind::Date => Some(parts.date),
+        ExportTemporalKind::Time => Some(format!("{}{fraction}", parts.time)),
+        ExportTemporalKind::DateTime => Some(format!("{} {}{fraction}", parts.date, parts.time)),
+        ExportTemporalKind::DateTimeWithTimeZone => {
+            Some(format!("{} {}{fraction}{}", parts.date, parts.time, normalize_export_timezone(&parts.zone)))
+        }
+    }
+}
+
+struct ExportRfc3339Parts {
+    date: String,
+    time: String,
+    fraction: Option<String>,
+    zone: String,
+}
+
+fn parse_export_date_parts(text: &str) -> Option<ExportRfc3339Parts> {
+    parse_export_rfc3339_parts(text).or_else(|| parse_export_local_temporal_parts(text))
+}
+
+fn parse_export_local_temporal_parts(text: &str) -> Option<ExportRfc3339Parts> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 10 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let date = &text[0..10];
+    if !date.as_bytes().iter().enumerate().all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()) {
+        return None;
+    }
+    if bytes.len() == 10 {
+        return Some(ExportRfc3339Parts {
+            date: date.to_string(),
+            time: "00:00:00".to_string(),
+            fraction: None,
+            zone: String::new(),
+        });
+    }
+    let separator = *bytes.get(10)?;
+    if separator != b'T' && separator != b' ' {
+        return None;
+    }
+    if bytes.len() < 19 || bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let time = &text[11..19];
+    if !time.as_bytes().iter().enumerate().all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit()) {
+        return None;
+    }
+    let rest = &text[19..];
+    let fraction = if let Some(rest) = rest.strip_prefix('.') {
+        let digit_count = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        if digit_count == 0 || digit_count > 9 || digit_count != rest.len() {
+            return None;
+        }
+        Some(format!(".{}", &rest[..digit_count]))
+    } else if rest.is_empty() {
+        None
+    } else {
+        return None;
+    };
+    Some(ExportRfc3339Parts { date: date.to_string(), time: time.to_string(), fraction, zone: String::new() })
+}
+
+fn parse_export_rfc3339_parts(text: &str) -> Option<ExportRfc3339Parts> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 20 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return None;
+    }
+    let separator = *bytes.get(10)?;
+    if separator != b'T' && separator != b' ' {
+        return None;
+    }
+    if bytes.get(13) != Some(&b':') || bytes.get(16) != Some(&b':') {
+        return None;
+    }
+    let date = &text[0..10];
+    let time = &text[11..19];
+    let rest = &text[19..];
+    let (fraction, zone) = if let Some(rest) = rest.strip_prefix('.') {
+        let digit_count = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        if digit_count == 0 || digit_count > 9 {
+            return None;
+        }
+        (Some(format!(".{}", &rest[..digit_count])), &rest[digit_count..])
+    } else {
+        (None, rest)
+    };
+    if zone.eq_ignore_ascii_case("z") || is_export_timezone_offset(zone) {
+        Some(ExportRfc3339Parts { date: date.to_string(), time: time.to_string(), fraction, zone: zone.to_string() })
+    } else {
+        None
+    }
+}
+
+fn normalize_export_fraction(fraction: Option<&str>, database_type: Option<DatabaseType>) -> String {
+    match fraction {
+        Some(fraction) if database_type == Some(DatabaseType::Mysql) && fraction.len() > 7 => fraction[..7].to_string(),
+        Some(fraction) => fraction.to_string(),
+        None => String::new(),
+    }
+}
+
+fn normalize_export_timezone(zone: &str) -> String {
+    if zone.eq_ignore_ascii_case("z") {
+        "+00:00".to_string()
+    } else {
+        zone.to_string()
+    }
+}
+
+fn is_export_timezone_offset(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 6
+        && matches!(bytes[0], b'+' | b'-')
+        && bytes[3] == b':'
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[4].is_ascii_digit()
+        && bytes[5].is_ascii_digit()
 }
 
 fn is_mysql_bit_type(column_type: &str) -> bool {
@@ -224,10 +551,76 @@ fn format_mysql_bit_literal(value: &Value) -> String {
             if !trimmed.is_empty() && trimmed.bytes().all(|byte| byte == b'0' || byte == b'1') {
                 return format!("b'{trimmed}'");
             }
-            format!("b'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+            format!("b'{}'", escape_mysql_compatible_export_sql_string(value))
         }
         other => format_export_sql_literal(other),
     }
+}
+
+fn is_mysql_binary_export_type(column_type: &str) -> bool {
+    let lower = column_type.trim().to_ascii_lowercase();
+    let base = lower.split(['(', ':', ' ', '\t', '\n']).next().unwrap_or("").trim();
+    matches!(base, "binary" | "varbinary" | "blob" | "tinyblob" | "mediumblob" | "longblob")
+}
+
+fn format_mysql_binary_export_literal(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => Some("NULL".to_string()),
+        Value::String(text) => format_mysql_binary_export_literal_text(text),
+        _ => None,
+    }
+}
+
+fn format_mysql_binary_export_literal_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let hex = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))?;
+    if hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        // DBX exposes MySQL binary cells as 0x-prefixed hex text. Keep it as a
+        // MySQL hex literal so exported INSERT statements round-trip bytes.
+        Some(if hex.is_empty() { "X''".to_string() } else { format!("0x{hex}") })
+    } else {
+        None
+    }
+}
+
+fn is_export_numeric_type(column_type: &str) -> bool {
+    let lower = column_type.to_ascii_lowercase();
+    [
+        "int",
+        "integer",
+        "bigint",
+        "smallint",
+        "tinyint",
+        "mediumint",
+        "serial",
+        "number",
+        "numeric",
+        "decimal",
+        "dec",
+        "fixed",
+        "float",
+        "double",
+        "real",
+    ]
+    .iter()
+    .any(|part| lower.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|token| token == *part))
+}
+
+fn format_export_numeric_literal(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) if is_export_numeric_literal(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
+fn is_export_numeric_literal(text: &str) -> bool {
+    if text.trim() != text || text.is_empty() {
+        return false;
+    }
+    text.parse::<f64>().is_ok_and(f64::is_finite)
+        && text.chars().all(|ch| ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E'))
+        && text.chars().any(|ch| ch.is_ascii_digit())
 }
 
 pub fn build_export_insert_statements(options: BuildExportInsertStatementsOptions) -> Result<Vec<String>, String> {
@@ -255,7 +648,11 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
     if insert_columns.is_empty() {
         return Ok(Vec::new());
     }
-    let batch_size = options.batch_size.unwrap_or(DATABASE_EXPORT_INSERT_BATCH_SIZE).max(1);
+    let batch_size = if options.database_type.is_some_and(uses_single_row_insert_statements) {
+        1
+    } else {
+        options.batch_size.unwrap_or(DATABASE_EXPORT_INSERT_BATCH_SIZE).max(1)
+    };
     let columns = insert_columns
         .iter()
         .map(|(_, column)| quote_table_identifier(options.database_type, column))
@@ -304,6 +701,29 @@ fn is_postgres_tsvector_export_column(database_type: Option<DatabaseType>, colum
             .map(|column_type| {
                 let normalized = column_type.trim().trim_matches('"').to_ascii_lowercase();
                 normalized == "tsvector" || normalized.ends_with(".tsvector")
+            })
+            .unwrap_or(false)
+}
+
+fn is_postgres_json_export_column(database_type: Option<DatabaseType>, column_type: Option<&str>) -> bool {
+    database_type == Some(DatabaseType::Postgres)
+        && column_type
+            .map(|column_type| {
+                let normalized = column_type.trim().trim_matches('"').to_ascii_lowercase();
+                matches!(normalized.as_str(), "json" | "jsonb")
+                    || normalized.ends_with(".json")
+                    || normalized.ends_with(".jsonb")
+            })
+            .unwrap_or(false)
+}
+
+fn is_postgres_vector_export_column(database_type: Option<DatabaseType>, column_type: Option<&str>) -> bool {
+    database_type == Some(DatabaseType::Postgres)
+        && column_type
+            .map(|column_type| {
+                let normalized = column_type.trim().trim_matches('"').to_ascii_lowercase();
+                let base = normalized.split(['(', ' ', '\t', '\n']).next().unwrap_or("").trim_matches('"');
+                matches!(base, "vector" | "halfvec") || base.ends_with(".vector") || base.ends_with(".halfvec")
             })
             .unwrap_or(false)
 }
@@ -564,7 +984,10 @@ pub async fn export_database_sql_core(
         .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
 
     // 2. Get pool
-    let pool_key = state.get_or_create_pool(&request.connection_id, Some(&request.database)).await?;
+    let client_session_id = database_export_client_session_id(&request.export_id);
+    let pool_key = state
+        .get_or_create_pool_for_session(&request.connection_id, Some(&request.database), Some(&client_session_id))
+        .await?;
 
     // 3. List tables
     let all_tables = crate::schema::list_tables_core(
@@ -645,8 +1068,17 @@ pub async fn export_database_sql_core(
     let mut functions: Vec<String> = Vec::new();
 
     if request.include_objects && request.selected_tables.is_empty() {
-        if let Ok(objects) =
-            crate::schema::list_objects_core(state, &request.connection_id, &request.database, &request.schema).await
+        if let Ok(objects) = crate::schema::list_objects_core(
+            state,
+            &request.connection_id,
+            &request.database,
+            &request.schema,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
         {
             for obj in &objects {
                 let ot = obj.object_type.to_uppercase();
@@ -789,7 +1221,7 @@ pub async fn export_database_sql_core(
             if !col_names.is_empty() {
                 // Get row count
                 let count_query = crate::transfer::count_sql(table_name, &request.schema, &db_type);
-                let total_rows = match crate::transfer::execute_on_pool(state, &pool_key, &count_query).await {
+                let total_rows = match crate::transfer::execute_read_on_pool(state, &pool_key, &count_query).await {
                     Ok(result) => result.rows.first().and_then(|r| r.first()).and_then(|v| match v {
                         serde_json::Value::Number(n) => n.as_u64(),
                         serde_json::Value::String(s) => s.parse::<u64>().ok(),
@@ -827,7 +1259,7 @@ pub async fn export_database_sql_core(
                         batch_size,
                     );
 
-                    let result = match crate::transfer::execute_on_pool(state, &pool_key, &sql).await {
+                    let result = match crate::transfer::execute_read_on_pool(state, &pool_key, &sql).await {
                         Ok(r) => r,
                         Err(e) => {
                             writeln!(file, "-- ERROR exporting data for table {table_name}: {e}")
@@ -927,12 +1359,15 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 view_name,
                 crate::db::ObjectSourceKind::View,
+                None,
             )
             .await
             {
                 Ok(obj_source) => {
-                    if !obj_source.source.is_empty() {
-                        writeln!(file, "{};\n", obj_source.source).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let source =
+                        build_export_object_source_sql(db_type, crate::db::ObjectSourceKind::View, &obj_source.source);
+                    if !source.is_empty() {
+                        writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                     }
                 }
                 Err(e) => {
@@ -968,12 +1403,18 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 proc_name,
                 crate::db::ObjectSourceKind::Procedure,
+                None,
             )
             .await
             {
                 Ok(obj_source) => {
-                    if !obj_source.source.is_empty() {
-                        writeln!(file, "{};\n", obj_source.source).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let source = build_export_object_source_sql(
+                        db_type,
+                        crate::db::ObjectSourceKind::Procedure,
+                        &obj_source.source,
+                    );
+                    if !source.is_empty() {
+                        writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                     }
                 }
                 Err(e) => {
@@ -1009,12 +1450,18 @@ pub async fn export_database_sql_core(
                 &request.schema,
                 func_name,
                 crate::db::ObjectSourceKind::Function,
+                None,
             )
             .await
             {
                 Ok(obj_source) => {
-                    if !obj_source.source.is_empty() {
-                        writeln!(file, "{};\n", obj_source.source).map_err(|e| format!("Failed to write file: {e}"))?;
+                    let source = build_export_object_source_sql(
+                        db_type,
+                        crate::db::ObjectSourceKind::Function,
+                        &obj_source.source,
+                    );
+                    if !source.is_empty() {
+                        writeln!(file, "{source}\n").map_err(|e| format!("Failed to write file: {e}"))?;
                     }
                 }
                 Err(e) => {
@@ -1126,6 +1573,119 @@ mod tests {
     }
 
     #[test]
+    fn mysql_export_inserts_escape_control_characters() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: Some("notes".to_string()),
+            qualified_table_name: None,
+            columns: vec!["body".to_string()],
+            column_types: vec![Some("text".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!("line1\nline2\tcol\rend\\slash\0\x1aO'Hara")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec!["INSERT INTO `notes` (`body`) VALUES ('line1\\nline2\\tcol\\rend\\\\slash\\0\\ZO''Hara');"]
+        );
+    }
+
+    #[test]
+    fn doris_export_inserts_escape_control_characters() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Doris),
+            schema: Some("warehouse".to_string()),
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["message".to_string()],
+            column_types: vec![Some("varchar(255)".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!("first\nsecond\tthird")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO `warehouse`.`events` (`message`) VALUES ('first\\nsecond\\tthird');"]);
+    }
+
+    #[test]
+    fn postgres_export_inserts_keep_literal_control_characters() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: Some("notes".to_string()),
+            qualified_table_name: None,
+            columns: vec!["body".to_string()],
+            column_types: vec![Some("text".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!("line1\nline2\tend")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(statements, vec!["INSERT INTO \"public\".\"notes\" (\"body\") VALUES ('line1\nline2\tend');"]);
+    }
+
+    #[test]
+    fn postgres_jsonb_export_preserves_json_escape_sequences() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["payload".to_string()],
+            column_types: vec![Some("jsonb".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(r#"{"text":"say \"hi\"","path":"C:\\tmp","quote":"O'Hara"}"#)]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                r#"INSERT INTO "public"."events" ("payload") VALUES ('{"text":"say \"hi\"","path":"C:\\tmp","quote":"O''Hara"}');"#
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_vector_export_preserves_pgvector_bracket_literals() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: Some("items".to_string()),
+            qualified_table_name: None,
+            columns: vec![
+                "id".to_string(),
+                "embedding".to_string(),
+                "qualified_embedding".to_string(),
+                "labels".to_string(),
+            ],
+            column_types: vec![
+                Some("integer".to_string()),
+                Some("vector(2)".to_string()),
+                Some("public.vector".to_string()),
+                Some("text[]".to_string()),
+            ],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(1), json!([1.2, 3.4]), json!(["5", "6"]), json!(["x", "y"])]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                r#"INSERT INTO "public"."items" ("id", "embedding", "qualified_embedding", "labels") VALUES (1, '[1.2,3.4]', '[5,6]', '{"x","y"}');"#
+            ]
+        );
+    }
+
+    #[test]
     fn builds_batched_insert_statements_for_export() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
@@ -1150,6 +1710,57 @@ mod tests {
     }
 
     #[test]
+    fn oracle_export_inserts_use_one_statement_per_row() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("APP".to_string()),
+            table_name: Some("USERS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["ID".to_string(), "NAME".to_string()],
+            column_types: Vec::new(),
+            column_extras: Vec::new(),
+            rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!("Linus")]],
+            batch_size: Some(100),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (1, 'Ada');",
+                "INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES (2, 'Linus');",
+            ]
+        );
+    }
+
+    #[test]
+    fn oracle_date_columns_export_as_date_literals() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Oracle),
+            schema: Some("APP".to_string()),
+            table_name: Some("EVENTS".to_string()),
+            qualified_table_name: None,
+            columns: vec!["ID".to_string(), "CREATED_ON".to_string(), "RAW_TEXT".to_string()],
+            column_types: vec![Some("NUMBER".to_string()), Some("DATE".to_string()), Some("VARCHAR2(64)".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![
+                vec![json!(1), json!("2022-08-25T09:58:43Z"), json!("2022-08-25T09:58:43Z")],
+                vec![json!(2), json!("2022-08-25T00:00:00Z"), json!("2022-08-25T00:00:00Z")],
+            ],
+            batch_size: Some(100),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"CREATED_ON\", \"RAW_TEXT\") VALUES (1, TO_DATE('2022-08-25 09:58:43', 'YYYY-MM-DD HH24:MI:SS'), '2022-08-25T09:58:43Z');",
+                "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"CREATED_ON\", \"RAW_TEXT\") VALUES (2, DATE '2022-08-25', '2022-08-25T00:00:00Z');",
+            ]
+        );
+    }
+
+    #[test]
     fn mysql_bit_columns_export_without_quoted_string_values() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
@@ -1167,6 +1778,114 @@ mod tests {
         assert_eq!(
             statements,
             vec!["INSERT INTO `flags` (`enabled`, `mask`, `label`) VALUES (b'1', b'1010', '1010'), (b'0', 3, 'off');"]
+        );
+    }
+
+    #[test]
+    fn mysql_export_uses_typed_literals_for_numeric_and_blob_columns() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: Some("t_test_01".to_string()),
+            qualified_table_name: None,
+            columns: vec!["id".to_string(), "f_blob".to_string(), "note".to_string()],
+            column_types: vec![Some("int".to_string()), Some("blob".to_string()), Some("varchar(64)".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![
+                vec![json!("1"), json!("0x68656c6c6f"), json!("0x68656c6c6f")],
+                vec![json!("2"), json!("0X"), json!("1")],
+            ],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO `t_test_01` (`id`, `f_blob`, `note`) VALUES (1, 0x68656c6c6f, '0x68656c6c6f'), (2, X'', '1');"
+            ]
+        );
+    }
+
+    #[test]
+    fn temporal_columns_export_without_rfc3339_separator_or_utc_suffix() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Mysql),
+            schema: None,
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["id".to_string(), "created_at".to_string(), "created_on".to_string(), "raw_text".to_string()],
+            column_types: vec![
+                Some("int".to_string()),
+                Some("timestamp".to_string()),
+                Some("date".to_string()),
+                Some("varchar(64)".to_string()),
+            ],
+            column_extras: Vec::new(),
+            rows: vec![vec![
+                json!(1),
+                json!("2026-06-12T10:11:12.123456789Z"),
+                json!("2026-06-12T10:11:12Z"),
+                json!("2026-06-12T10:11:12Z"),
+            ]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO `events` (`id`, `created_at`, `created_on`, `raw_text`) VALUES (1, '2026-06-12 10:11:12.123456', '2026-06-12', '2026-06-12T10:11:12Z');"
+            ]
+        );
+    }
+
+    #[test]
+    fn postgres_timestamptz_export_keeps_timezone_without_rfc3339_t_separator() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Postgres),
+            schema: Some("public".to_string()),
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["recorded_at".to_string(), "local_at".to_string()],
+            column_types: vec![
+                Some("timestamp with time zone".to_string()),
+                Some("timestamp without time zone".to_string()),
+            ],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!("2026-06-12T10:11:12Z"), json!("2026-06-12T18:11:12+08:00")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO \"public\".\"events\" (\"recorded_at\", \"local_at\") VALUES ('2026-06-12 10:11:12+00:00', '2026-06-12 18:11:12');"
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlserver_rowversion_timestamp_type_is_not_treated_as_datetime() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            schema: Some("dbo".to_string()),
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["row_version".to_string(), "created_at".to_string()],
+            column_types: vec![Some("timestamp".to_string()), Some("datetime2(3)".to_string())],
+            column_extras: Vec::new(),
+            rows: vec![vec![json!("2026-06-12T10:11:12Z"), json!("2026-06-12T10:11:12.1234567Z")]],
+            batch_size: Some(10),
+        })
+        .unwrap();
+
+        assert_eq!(
+            statements,
+            vec![
+                "INSERT INTO [dbo].[events] ([row_version], [created_at]) VALUES ('2026-06-12T10:11:12Z', '2026-06-12 10:11:12.123');"
+            ]
         );
     }
 

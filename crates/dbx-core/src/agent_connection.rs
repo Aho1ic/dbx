@@ -11,6 +11,8 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         mongo_agent_database(config, database)
     } else if matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
         oracle_agent_database(config, database)
+    } else if matches!(config.db_type, DatabaseType::Kingbase | DatabaseType::Highgo | DatabaseType::Vastbase) {
+        postgres_like_agent_database(config, database).to_string()
     } else if is_h2_file_connection(config) {
         h2_agent_database(config)
     } else {
@@ -251,9 +253,6 @@ pub fn oracle_alternate_connect_configs(config: &ConnectionConfig, err: &str) ->
     if config.db_type != DatabaseType::Oracle {
         return Vec::new();
     }
-    if config.driver_profile.as_deref() == Some("oracle-10g") {
-        return Vec::new();
-    }
     if config.connection_string.as_deref().is_some_and(|value| !value.trim().is_empty()) {
         return Vec::new();
     }
@@ -398,23 +397,18 @@ fn postgres_like_agent_jdbc_connection_string(
         DatabaseType::Vastbase => "vastbase",
         _ => unreachable!("postgres-like agent JDBC URL requested for {:?}", config.db_type),
     };
-    let base = format!("jdbc:{scheme}://{host}:{port}/{}", database.trim());
+    let database = postgres_like_agent_database(config, database);
+    let base = format!("jdbc:{scheme}://{host}:{port}/{database}");
     append_agent_url_params(base, config.url_params.as_deref())
 }
 
-pub fn should_retry_oracle_with_10g_driver(config: &ConnectionConfig, err: &str) -> bool {
-    !oracle_auth_fallback_profiles(config, err).is_empty()
-}
-
-pub fn oracle_auth_fallback_profiles(config: &ConnectionConfig, err: &str) -> Vec<&'static str> {
-    if config.db_type != DatabaseType::Oracle {
-        return Vec::new();
+fn postgres_like_agent_database<'a>(config: &'a ConnectionConfig, database: &'a str) -> &'a str {
+    let database = database.trim();
+    if !database.is_empty() {
+        return database;
     }
-    let normalized = err.to_lowercase();
-    if !normalized.contains("ora-28040") && !normalized.contains("no matching authentication protocol") {
-        return Vec::new();
-    }
-    Vec::new()
+    // Vastbase/PostgreSQL-compatible JDBC drivers can reject an empty catalog path.
+    config.effective_database().unwrap_or("")
 }
 
 pub fn oracle_alternate_connect_config(config: &ConnectionConfig, err: &str) -> Option<ConnectionConfig> {
@@ -587,6 +581,7 @@ mod tests {
             driver_profile: None,
             driver_label: None,
             url_params: None,
+            agent_java_options: Vec::new(),
             host: "127.0.0.1".to_string(),
             port: 3306,
             username: "user".to_string(),
@@ -595,6 +590,7 @@ mod tests {
             visible_databases: None,
             visible_schemas: None,
             attached_databases: Vec::new(),
+            init_script: None,
             color: None,
             transport_layers: Vec::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
@@ -625,6 +621,8 @@ mod tests {
             jdbc_driver_paths: Vec::new(),
             one_time: false,
             read_only: false,
+            is_production: false,
+            production_databases: vec![],
         }
     }
 
@@ -705,6 +703,16 @@ mod tests {
     }
 
     #[test]
+    fn vastbase_agent_url_defaults_to_postgres_database_when_empty() {
+        let cfg = config(DatabaseType::Vastbase, Some(""));
+
+        let params = agent_connect_params(&cfg, "vastbase.example.com", 5432, "");
+
+        assert_eq!(params["database"], "postgres");
+        assert_eq!(params["connection_string"], "jdbc:vastbase://vastbase.example.com:5432/postgres");
+    }
+
+    #[test]
     fn zookeeper_agent_params_preserve_configured_connect_string() {
         let mut cfg = config(DatabaseType::ZooKeeper, None);
         cfg.connection_string = Some("zk-1:2181,zk-2:2181/app".to_string());
@@ -749,10 +757,9 @@ mod tests {
     }
 
     #[test]
-    fn oracle_listener_error_hint_skips_other_databases() {
+    fn oracle_listener_error_hint_skips_non_oracle_databases() {
         let err = "Agent RPC error (-1): ORA-12541: TNS:no listener";
         let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
-        cfg.driver_profile = Some("oracle-legacy".to_string());
 
         assert!(oracle_error_with_driver_hint(&cfg, err).contains("Service Name"));
 
@@ -907,20 +914,6 @@ mod tests {
         assert_eq!(retry.connection_string.as_deref(), Some("jdbc:oracle:thin:@127.0.0.1:3306:ORCL"));
         assert!(oracle_alternate_connect_config(&retry, "ORA-01017: invalid username/password").is_none());
         assert!(oracle_alternate_connect_config(&cfg, "ORA-12541: TNS:no listener").is_some());
-    }
-
-    #[test]
-    fn oracle_auth_errors_do_not_switch_driver_profiles() {
-        let mut cfg = config(DatabaseType::Oracle, Some("ORCL"));
-        cfg.driver_profile = Some("oracle".to_string());
-
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
-
-        cfg.driver_profile = Some("oracle-legacy".to_string());
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
-
-        cfg.driver_profile = Some("oracle-10g".to_string());
-        assert!(oracle_auth_fallback_profiles(&cfg, "ORA-28040: No matching authentication protocol").is_empty());
     }
 
     #[test]

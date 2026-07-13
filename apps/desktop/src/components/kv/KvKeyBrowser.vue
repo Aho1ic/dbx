@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { ChevronDown, ChevronRight, FolderClosed, FolderOpen, KeyRound, Loader2, Plus, RefreshCw, Search, Trash2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,11 +11,23 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
-import type { KvCreateMode, KvGetResponse, KvKeySummary, KvListPrefixOptions, KvPutOptions, KvPutResponse, KvValue } from "@/lib/api";
-import { buildKvKeyTree, flattenVisibleKvKeyTree, preserveKvExpandedGroupIds, type KvKeyTreeNode } from "@/lib/kvKeyTree";
-import { refreshedKvSelectionKey } from "@/lib/kvRefreshSelection";
-import { formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kvValueDisplay";
-import { createLazyKvKeyTreeState, flattenLazyKvKeyTree, lazyExpandedKeyFromId, normalizeZooKeeperPath, parentZooKeeperPath, replaceLazyKvChildren, replaceLazyKvFocusedRoot, resetLazyKvKeyTree, type LazyKvKeyTreeNode, type LazyKvKeyTreeRow } from "@/lib/zookeeperLazyKeyTree";
+import type { KvCreateMode, KvGetResponse, KvKeySummary, KvListPrefixOptions, KvPutOptions, KvPutResponse, KvValue } from "@/lib/backend/api";
+import { buildKvKeyTree, flattenVisibleKvKeyTree, preserveKvExpandedGroupIds, type KvKeyTreeNode } from "@/lib/kv/kvKeyTree";
+import { refreshedKvSelectionKey } from "@/lib/kv/kvRefreshSelection";
+import { formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kv/kvValueDisplay";
+import {
+  createLazyKvKeyTreeState,
+  createZooKeeperChildPathDraft,
+  flattenLazyKvKeyTree,
+  lazyExpandedKeyFromId,
+  normalizeZooKeeperPath,
+  parentZooKeeperPath,
+  replaceLazyKvChildren,
+  replaceLazyKvFocusedRoot,
+  resetLazyKvKeyTree,
+  type LazyKvKeyTreeNode,
+  type LazyKvKeyTreeRow,
+} from "@/lib/zookeeper/zookeeperLazyKeyTree";
 import { useToast } from "@/composables/useToast";
 
 interface KvKeyBrowserLabels {
@@ -32,6 +45,7 @@ interface KvKeyBrowserLabels {
   deleteTitle: string;
   keyPlaceholder: string;
   keyRequired: string;
+  rootReadonly?: string;
   saved: string;
   deleted: string;
   base64Readonly: string;
@@ -84,6 +98,7 @@ const props = withDefaults(
 
 const { t } = useI18n();
 const { toast } = useToast();
+const connectionStore = useConnectionStore();
 const searchInputRef = ref<HTMLInputElement>();
 const prefix = ref("");
 const keys = ref<KvKeySummary[]>([]);
@@ -231,7 +246,7 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
 async function loadLazyRootSummary(rootPath: string, children: KvKeySummary[], continuation?: string | null): Promise<KvKeySummary | null> {
   try {
     const rootValue = await props.api.get(props.connectionId, rootPath);
-    if (rootValue.found) return { key: rootValue.key || rootPath, ...(rootValue.metadata ?? {}) };
+    if (rootValue.found) return { key: rootValue.key || rootPath, ...rootValue.metadata };
     if (children.length === 0 && !continuation) return null;
   } catch {
     if (children.length === 0 && !continuation) return null;
@@ -375,7 +390,8 @@ function onRowDoubleClick(node: BrowserTreeNode) {
 }
 
 function createKeyPrefix(parentPath?: string): string {
-  const path = props.lazyHierarchy ? normalizeZooKeeperPath(parentPath ?? prefix.value) : (parentPath ?? prefix.value.trim());
+  if (props.lazyHierarchy) return createZooKeeperChildPathDraft(parentPath ?? prefix.value);
+  const path = parentPath ?? prefix.value.trim();
   if (!path) return "";
   if (path === "/") return "/";
   return path.endsWith("/") ? path : `${path}/`;
@@ -408,11 +424,16 @@ function putOptions(): KvPutOptions | undefined {
 }
 
 async function saveKey() {
-  const key = editKey.value.trim();
-  if (!key) {
+  const rawKey = editKey.value.trim();
+  if (!rawKey) {
     editError.value = props.labels.keyRequired;
     return;
   }
+  if (props.lazyHierarchy && normalizeZooKeeperPath(rawKey) === "/") {
+    editError.value = props.labels.rootReadonly || props.labels.keyRequired;
+    return;
+  }
+  const key = props.lazyHierarchy ? normalizeZooKeeperPath(rawKey) : rawKey;
   saving.value = true;
   editError.value = "";
   try {
@@ -539,7 +560,14 @@ function refresh(): boolean {
 
 watch(
   () => props.connectionId,
-  () => void loadKeys(true),
+  async () => {
+    try {
+      await connectionStore.ensureConnected(props.connectionId);
+    } catch {
+      // Connection failed — loadKeys will show the error state
+    }
+    void loadKeys(true);
+  },
 );
 
 watch(
@@ -552,7 +580,14 @@ watch(
   { immediate: true },
 );
 
-onMounted(() => void loadKeys(true));
+onMounted(async () => {
+  try {
+    await connectionStore.ensureConnected(props.connectionId);
+  } catch (e) {
+    console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
+  }
+  void loadKeys(true);
+});
 defineExpose({ focusSearch, refresh });
 </script>
 

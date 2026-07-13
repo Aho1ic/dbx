@@ -1,132 +1,124 @@
-# 本地特色修改记录
+# DBX 本地差异索引
 
-> 本文档记录此 fork 相对上游仓库的所有本地修改。**拉取远端代码合并时，请逐条核对本文件并保留这些修改**。
-> 基线提交：`56c937f refactor: migrate all context menus to CustomContextMenu`
-> 最近更新：2026-06-05（确认保留：表属性独立标签页 + 表结构 DDL 视图切换 + DataGrid 移除旧表属性抽屉）
+> 本文件只记录当前 fork 相对上游 `t8y2/dbx` 的净差异，作为以后合并上游时的保留清单。
+>
+> 详细的 Aeroric 内核迭代说明、API 变化和编译修复矩阵见
+> [`AERORIC_DBX_CORE_UPGRADE_20260714.md`](./AERORIC_DBX_CORE_UPGRADE_20260714.md)。
 
-## 一、新增"表属性"独立标签页（Table Info Tab）
+## 当前同步基准
 
-把原本只能作为 DataGrid 侧边抽屉显示的表元数据（字段、索引、外键、触发器、DDL）独立为可单独打开的标签页。从侧边栏右键表/视图选「表属性」即可打开。
+- 上游仓库：`https://github.com/t8y2/dbx.git`
+- 合并前本地提交：`2a888c6879fe22cbd37a12e4395f55d5113ac262`
+- 本次上游提交：`8f619fb79145518fad073ffd4b7334626fffba51`
+- 上游版本跨度：`v0.5.39` 到 `v0.5.55`
+- 共同基线：`44884efa9bfda70f113a92bea8797647c22ebd51`
+- 合并前备份分支：`backup/pre-upstream-merge-20260713`
+- 文档核对日期：2026-07-14
 
-涉及文件：
+## 必须保留的产品功能
 
-| 文件 | 改动性质 |
-| --- | --- |
-| `apps/desktop/src/components/grid/TableInfoView.vue` | **新增** — 独立的表属性视图组件 |
-| `apps/desktop/src/types/database.ts` | 给 `QueryTab.mode` 增加 `"tableInfo"`；新增 `tableInfoTarget`、`tableInfoActiveTab` 字段 |
-| `apps/desktop/src/stores/queryStore.ts` | 新增 `openTableInfo()` action 并导出 |
-| `apps/desktop/src/components/sidebar/TreeItem.vue` | 表/视图右键菜单新增「表属性」项；新增 `openTableInfoTab()` 函数 |
-| `apps/desktop/src/components/layout/ContentArea.vue` | 异步导入 `TableInfoView`；为 `mode === 'tableInfo'` 渲染 |
-| `apps/desktop/src/components/layout/AppTabBar.vue` | `tableInfo` 模式使用 `TableProperties` 图标，绿色配色组 |
-| `apps/desktop/src/lib/tabPresentation.ts` | `tabDisplayTitle` 处理 `tableInfo` 模式标题 |
+### 1. 独立“表属性”标签页
 
-i18n 新增键（三种语言均加）：
-- `grid.tableInfoDefault`：默认值列标题
-- `grid.tableInfoTabTitle`：标签页标题模板 `{tableName} 属性`
-
-## 二、表结构编辑器 — DDL 视图切换
-
-`TableStructureEditor.vue` 在「字段」Tab 增加「DDL 视图 / 编辑视图」切换按钮，DDL 视图以紧凑方式展示字段信息。
+本地把 DataGrid 右侧表属性抽屉迁移成独立标签页，展示字段、索引、外键、触发器和 DDL。
 
 涉及文件：
-- `apps/desktop/src/components/structure/TableStructureEditor.vue`：新增 `columnViewMode` 状态、DDL 视图表格、视图切换按钮
-- 新增 i18n 键：`structureEditor.ddlView` / `editView` / `notNull` / `noDefault`
 
-## 三、DataGrid 表属性抽屉已删除（迁移至独立标签页）
+- `apps/desktop/src/components/grid/TableInfoView.vue`
+- `apps/desktop/src/types/database.ts`
+- `apps/desktop/src/stores/queryStore.ts`
+- `apps/desktop/src/components/sidebar/TreeItem.vue`
+- `apps/desktop/src/components/layout/ContentArea.vue`
+- `apps/desktop/src/components/layout/AppTabBar.vue`
+- `apps/desktop/src/lib/app/openTabsPersistence.ts`
+- `apps/desktop/src/lib/tabs/tabPresentation.ts`
+- `apps/desktop/src/composables/useNavigationTargets.ts`
+- `apps/desktop/src/i18n/locales/en.ts`
+- `apps/desktop/src/i18n/locales/es.ts`
+- `apps/desktop/src/i18n/locales/zh-CN.ts`
 
-历史上 `DataGrid.vue` 内嵌了一个右侧表属性抽屉（字段/索引/外键/触发器/DDL）。现已全部移除，统一改用一、节中的 `TableInfoView` 标签页。
+关键契约：
 
-`apps/desktop/src/components/grid/DataGrid.vue` 的清理：
+- `QueryTab.mode` 必须包含 `"tableInfo"`。
+- `QueryTab` 必须保留 `tableInfoTarget` 和 `tableInfoActiveTab`。
+- `queryStore.openTableInfo()` 必须按连接、数据库、catalog、schema、表名复用标签页。
+- “查看 DDL”导航应打开独立表属性标签页的 DDL 子页，不应重新启用 DataGrid 抽屉。
+- 标签页持久化、复制、标题、工具提示和失效表关闭逻辑必须继续支持 `tableInfo`。
 
-- 删除模块级 `globalDdlOpen` ref 与配套 `<script lang="ts">` 块
-- 删除全部状态：`showTableInfo`、`activeTableInfoTab`、`ddlContent`、`ddlLoading`、`ddlWidth`、`ddlWrap`、`isResizingDdl`、`indexes/foreignKeys/triggers` 系列、`searchQuery`、`tableInfoTabs` 等
-- 删除函数：`toggleTableInfo`、`selectTableInfoTab`、`fetchDdl`、`fetchIndexes`、`fetchForeignKeys`、`fetchTriggers`、`copyDdl`、`toggleDdlWrap`、`onDdlResize*`、`scrollToTableInfoColumn`、`matchesTableInfoColumn`
-- 删除 `filteredColumns/Indexes/ForeignKeys/Triggers/DdlContent` computed
-- 删除 `defineExpose` 中的 `showDdl` / `toggleDdl` / `showTableInfo` / `toggleTableInfo`
-- 删除模板内 `<!-- Table Info Drawer -->` 整个块（约 200 行）
-- 删除 CSS：`.ddl-drawer-resizing`、`.ddl-code :deep(.ddl-kw|.ddl-ident|.ddl-str)`
-- 移除随之变为未使用的导入：`WrapText`、`KeyRound`、`Link2`、`ListTree`、`TableProperties`、`type Component`、`ForeignKeyInfo`、`IndexInfo`、`TriggerInfo`、`useSqlHighlighter`
+### 2. DataGrid 不再内嵌表属性抽屉
 
-`apps/desktop/src/components/layout/ContentArea.vue`：
+`apps/desktop/src/components/grid/DataGrid.vue` 中旧抽屉相关状态、加载函数、模板、拖拽宽度、Mongo 索引删除弹窗及样式均已移除。
 
-- `DataGridHandle` 类型移除 `showDdl` / `toggleDdl` 字段
-- 工具栏「表属性」按钮改为调用本地 `openTableInfoTab()`，调用 `queryStore.openTableInfo(...)` 直接打开新标签页（不再开侧边抽屉）
+以后解决冲突时不要恢复以下旧接口：
 
-## 四、TreeItem 上下文菜单调整
+- `showTableInfo`
+- `activeTableInfoTab`
+- `toggleTableInfo()` / `selectTableInfoTab()`
+- `fetchDdl()` / `fetchIndexes()` / `fetchForeignKeys()` / `fetchTriggers()`
+- `showDdl` / `toggleDdl`
+- `tableInfoTab` prop
+- `<!-- Table Info Drawer -->`
 
-`apps/desktop/src/components/sidebar/TreeItem.vue`：
+右侧单元格详情面板继续使用两列布局，不能因恢复旧抽屉而改回三列。
 
-- 移除未使用的 `shouldPreventRenameCloseAutoFocus` 导入和 `onContextMenuCloseAutoFocus` 函数
-- 「复制名称」菜单项的显示条件由 `node.type !== "connection" && hasTypeMenu.value` 简化为 `hasTypeMenu.value`（即连接节点也允许复制名称）
+### 3. 表结构编辑器 DDL 视图
 
-## 五、修复 QueryHistory 的 ref 误用
+`apps/desktop/src/components/structure/TableStructureEditor.vue` 在字段页保留“DDL 视图 / 编辑视图”切换。
 
-`apps/desktop/src/components/editor/QueryHistory.vue`：
+相关 i18n：
 
-- `selectedEntry = entry` → `selectedEntry.value = entry`（`selectedEntry` 是 `ref`，需用 `.value` 赋值）
+- `structureEditor.ddlView`
+- `structureEditor.editView`
+- `structureEditor.notNull`
+- `structureEditor.noDefault`
 
-## 六、TableInfoView DDL 配色调暗（更高级、更柔和）
+## 本地运维和仓库差异
 
-`apps/desktop/src/components/grid/TableInfoView.vue` 末尾 `<style scoped>`：
+- 删除 `.github/workflows/docs.yml`
+- 删除 `.github/workflows/sync-mirrors.yml`
+- 新增 `CLAUDE.md`
+- 新增 `build-and-push.sh`
+- `LICENSE` 从上游 Apache-2.0 改为本地 MIT，Copyright Aho1ic
+- `README-NIX.md`、`README.md`、`README.zh-CN.md` 各清理 1 处上游行尾空格，无内容变化
 
-- 关键字（`.ddl-kw`）：`oklch(0.6 0.15 250)` → 浅色 `oklch(0.42 0.05 245)` / 深色 `oklch(0.74 0.06 235)`
-- 标识符（`.ddl-ident`）：`oklch(0.65 0.15 150)` → 浅色 `oklch(0.46 0.04 165)` / 深色 `oklch(0.78 0.05 155)`
-- 字符串（`.ddl-str`）：`oklch(0.65 0.15 50)` → 浅色 `oklch(0.5 0.07 40)` / 深色 `oklch(0.78 0.07 55)`
-- 通过 `:global(.dark)` 选择器为深色主题单独提色，避免暗背景下读不清
+`build-and-push.sh` 会构建、替换 `/Applications/DBX.app`，并执行 `git push aho1ic main`。它不是通用 CI 脚本，运行前必须确认远端和发布意图。
 
-## 合并远端代码的操作建议
+## 已纠正的旧记录
 
-本地已额外保存可恢复补丁：
+旧版文档曾记录 `QueryHistory.vue` 的 `ref` 赋值修复，但当前 fork 相对上游的净差异中没有该文件，因此不再把它列为必须恢复的本地修改。
 
-- 补丁目录：`../dbx-local-backups/`
-- 最新补丁：`../dbx-local-backups/dbx-local-features-20260605.patch`
+旧版文档中的路径 `apps/desktop/src/lib/tabPresentation.ts` 已随上游目录调整为：
 
-每次拉取并合并上游前，先重新生成一次补丁，防止当前工作区改动被误覆盖：
-
-```bash
-mkdir -p ../dbx-local-backups
-git diff --binary > ../dbx-local-backups/dbx-local-features-$(date +%Y%m%d).patch
-git diff --no-index -- /dev/null apps/desktop/src/components/grid/TableInfoView.vue >> ../dbx-local-backups/dbx-local-features-$(date +%Y%m%d).patch || true
+```text
+apps/desktop/src/lib/tabs/tabPresentation.ts
 ```
 
-如果合并后发现这两块页面改动丢失，可从补丁恢复：
+## 合并上游检查清单
 
 ```bash
-git apply --3way ../dbx-local-backups/dbx-local-features-20260605.patch
+git fetch origin --prune
+git branch backup/pre-upstream-merge-$(date +%Y%m%d)
+git merge origin/main
 ```
 
-```bash
-# 1. 备份当前本地修改
-git stash push -u -m "local-features-backup-$(date +%Y%m%d)"
+冲突处理原则：
 
-# 2. 拉取远端
-git fetch origin
-git merge origin/main   # 或 git rebase origin/main
+1. 先保留上游最新架构、API 路径和组件结构。
+2. 再按本文件恢复独立表属性标签页和表结构 DDL 视图。
+3. 不恢复 DataGrid 旧表属性抽屉。
+4. 保持两个本地 workflow 删除状态，除非发布流程明确改变。
+5. 单独审查 `LICENSE`，不要把许可证差异当普通文本冲突处理。
 
-# 3. 恢复本地修改
-git stash pop
-```
-
-**冲突处理重点**：
-
-- `apps/desktop/src/types/database.ts` 中 `QueryTab.mode` 联合类型 — 必须保留 `"tableInfo"`，以及 `tableInfoTarget` / `tableInfoActiveTab` 字段
-- `apps/desktop/src/stores/queryStore.ts` 中 `openTableInfo` 函数及导出
-- `apps/desktop/src/components/sidebar/TreeItem.vue` 表/视图菜单中的「表属性」项
-- `apps/desktop/src/components/layout/ContentArea.vue` 中：
-  - `tableInfo` 模式的渲染分支
-  - `DataGridHandle` 类型不含 `showDdl` / `toggleDdl`
-  - 工具栏「表属性」按钮调用 `openTableInfoTab()` 而非 `dataGridRef?.toggleDdl()`
-- `apps/desktop/src/components/layout/AppTabBar.vue` 中 `tabIconClass` 和图标渲染
-- `apps/desktop/src/lib/tabPresentation.ts` 中 `tableInfo` 标题分支
-- `apps/desktop/src/components/structure/TableStructureEditor.vue` 的 DDL 视图切换块（位于"字段"TabsList 旁的按钮组与 `TabsContent value="columns"` 内的 DDL `<table>`）
-- `apps/desktop/src/components/grid/DataGrid.vue` —— **不要把上游的表属性抽屉合回来**：globalDdlOpen、showTableInfo、ddlContent 等状态、`onDdlResize*` 函数、`<!-- Table Info Drawer -->` 模板、`.ddl-code/.ddl-kw/.ddl-ident/.ddl-str` 样式都已删除
-- `apps/desktop/src/components/grid/TableInfoView.vue` —— DDL 配色（`<style scoped>` 中的浅色 + `:global(.dark)` 深色覆盖）
-- 所有 i18n 文件 (`zh-CN.ts` / `en.ts` / `es.ts`) 的新增键
-
-合并完成后必跑：
+合并后至少运行：
 
 ```bash
+pnpm test
 pnpm exec vue-tsc --noEmit --project apps/desktop/tsconfig.json
 pnpm lint
-pnpm tauri build   # 验证可正常打包
+pnpm build
+cargo check -p dbx-core --locked
+git diff --check
 ```
+
+## 许可证提示
+
+当前本地 `LICENSE` 是 MIT，而上游目标提交的 `LICENSE` 是 Apache-2.0。合并源代码不会自动解决许可证归属和再许可问题。发布、分发或把本 fork 作为 Aeroric 内核交付前，应由项目负责人进行许可证审查并保留上游版权与 NOTICE 要求。本提示不是法律意见。

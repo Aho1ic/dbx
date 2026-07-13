@@ -12,6 +12,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mongodb.MongoClientSettings;
+import com.mongodb.client.model.UpdateOptions;
 import java.io.FileInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,6 +21,7 @@ import java.security.PrivateKey;
 import java.util.Base64;
 import java.util.Date;
 import org.bson.Document;
+import org.bson.types.ObjectId;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -97,6 +99,16 @@ class MongoAgentTest {
     }
 
     @Test
+    void legacyJsonRpcHandshakeRemainsProtocolV1() {
+        JsonObject result = JsonParser.parseString(MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"handshake\",\"params\":{}}"
+        )).getAsJsonObject().getAsJsonObject("result");
+
+        assertEquals(1, result.get("protocolVersion").getAsInt());
+        assertFalse(containsCapability(result.getAsJsonArray("capabilities"), AgentProtocol.CAPABILITY_MULTI_SESSION));
+    }
+
+    @Test
     void listIndexesMethodIsRecognizedOverJsonRpc() {
         String response = MongoAgent.handleRequest(
             "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"list_indexes\","
@@ -106,6 +118,150 @@ class MongoAgentTest {
         assertEquals(8, json.get("id").getAsInt());
         assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
         assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void countDocumentsMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"count_documents\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\",\"filter\":\"{}\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(15, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void parsesOptionalDocumentParameters() {
+        JsonObject params = new JsonObject();
+        params.addProperty("projection", "{\"title\":1,\"_id\":0}");
+        params.addProperty("filter", "");
+
+        Document projection = MongoAgent.documentOrNull(params, "projection");
+
+        assertNotNull(projection);
+        assertEquals(1, projection.get("title"));
+        assertEquals(0, projection.get("_id"));
+        assertEquals(null, MongoAgent.documentOrNull(params, "filter"));
+        assertEquals(null, MongoAgent.documentOrNull(params, "sort"));
+    }
+
+    @Test
+    void documentParametersParseExtendedJsonLongFilters() {
+        JsonObject params = new JsonObject();
+        params.addProperty("filter", "{\"processInfoId\":{\"$numberLong\":\"2048938405781032962\"},\"snowflake\":{\"$numberLong\":\"9007199254740993\"}}");
+
+        Document filter = MongoAgent.documentOrNull(params, "filter");
+
+        assertNotNull(filter);
+        assertEquals(2_048_938_405_781_032_962L, filter.get("processInfoId"));
+        assertEquals(9_007_199_254_740_993L, filter.get("snowflake"));
+    }
+
+    @Test
+    void serverVersionMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"server_version\","
+                + "\"params\":{\"database\":\"admin\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(9, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void createIndexMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"create_index\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\","
+                + "\"keys_json\":\"{\\\"email\\\":1}\",\"options_json\":\"{\\\"name\\\":\\\"email_1\\\",\\\"background\\\":true}\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(12, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+        assertTrue(AgentProtocol.MONGO_LEGACY_METHODS.contains(AgentProtocol.MONGO_METHOD_CREATE_INDEX));
+    }
+
+    @Test
+    void dropIndexesMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"drop_indexes\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\","
+                + "\"indexes_json\":\"\\\"email_1\\\"\",\"single\":true}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(13, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+        assertTrue(AgentProtocol.MONGO_LEGACY_METHODS.contains(AgentProtocol.MONGO_METHOD_DROP_INDEXES));
+    }
+
+    @Test
+    void dropCollectionMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"drop_collection\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\"}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(14, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+        assertTrue(AgentProtocol.MONGO_LEGACY_METHODS.contains(AgentProtocol.MONGO_METHOD_DROP_COLLECTION));
+    }
+
+    @Test
+    void updateDocumentsMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"update_documents\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\",\"filter_json\":\"{}\","
+                + "\"update_json\":\"{\\\"$set\\\":{\\\"data\\\":null}}\",\"many\":true}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(10, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+    }
+
+    @Test
+    void parsesArrayFiltersUpdateOption() {
+        UpdateOptions options = MongoAgent.updateOptionsForWrite(
+            "{\"arrayFilters\":[{\"item.id\":322678}]}"
+        );
+
+        assertEquals(1, options.getArrayFilters().size());
+        assertEquals(322678, ((Document) options.getArrayFilters().get(0)).getInteger("item.id"));
+    }
+
+    @Test
+    void rejectsUnsupportedUpdateOptions() {
+        IllegalArgumentException error = assertThrows(
+            IllegalArgumentException.class,
+            () -> MongoAgent.updateOptionsForWrite("{\"upsert\":true}")
+        );
+        assertEquals("Unsupported update option: upsert", error.getMessage());
+    }
+
+    @Test
+    void deleteDocumentsMethodIsRecognizedOverJsonRpc() {
+        String response = MongoAgent.handleRequest(
+            "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"delete_documents\","
+                + "\"params\":{\"database\":\"app\",\"collection\":\"orders\","
+                + "\"filter_json\":\"{\\\"status\\\":\\\"draft\\\"}\",\"many\":true}}");
+
+        JsonObject json = JsonParser.parseString(response).getAsJsonObject();
+        assertEquals(11, json.get("id").getAsInt());
+        assertEquals("Not connected", json.getAsJsonObject("error").get("message").getAsString());
+        assertFalse(json.getAsJsonObject("error").get("message").getAsString().contains("Unknown method"));
+        assertTrue(AgentProtocol.MONGO_LEGACY_METHODS.contains(AgentProtocol.MONGO_METHOD_DELETE_DOCUMENTS));
+    }
+
+    @Test
+    void extractsServerVersionFromBuildInfo() {
+        assertEquals("4.4.29", MongoAgent.serverVersionFromBuildInfo(new Document("version", "4.4.29")));
+        assertThrows(IllegalStateException.class, () -> MongoAgent.serverVersionFromBuildInfo(new Document("ok", 1)));
     }
 
     @Test
@@ -309,6 +465,25 @@ class MongoAgentTest {
     }
 
     @Test
+    void convertValueKeepsObjectIdAsStringByDefault() {
+        assertEquals(
+            "507f1f77bcf86cd799439011",
+            MongoAgent.convertValue(new ObjectId("507f1f77bcf86cd799439011"))
+        );
+    }
+
+    @Test
+    void bsonToExtendedJsonUsesMongoExtendedJson() {
+        Document doc = new Document("_id", new ObjectId("507f1f77bcf86cd799439011"))
+            .append("created_at", Date.from(java.time.Instant.parse("2026-06-10T13:59:31.287Z")));
+
+        assertEquals(
+            "{\"_id\":{\"$oid\":\"507f1f77bcf86cd799439011\"},\"created_at\":{\"$date\":\"2026-06-10T13:59:31.287Z\"}}",
+            new com.google.gson.Gson().toJson(MongoAgent.bsonToExtendedJson(doc))
+        );
+    }
+
+    @Test
     void documentForWriteParsesMongoShellIsoDateStrings() {
         Document doc = MongoAgent.documentForWrite("{\"$set\":{\"CreateDate\":\"ISODate(\\\"2026-06-10T13:59:31.287Z\\\")\"}}");
 
@@ -331,6 +506,17 @@ class MongoAgentTest {
         Document set = (Document) doc.get("$set");
         assertTrue(set.get("CreateDate") instanceof Date);
         assertEquals(1_755_138_343_718L, ((Date) set.get("CreateDate")).getTime());
+    }
+
+    @Test
+    void bulkUpdateRequiresOperatorDocument() {
+        Document update = MongoAgent.documentForWrite("{\"$set\":{\"data\":null}}");
+        MongoAgent.requireBulkUpdateOperatorDocument(update);
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> MongoAgent.requireBulkUpdateOperatorDocument(MongoAgent.documentForWrite("{\"data\":null}"))
+        );
     }
 
     // ─── helpers ───

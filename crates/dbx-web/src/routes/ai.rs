@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -19,6 +20,13 @@ use crate::state::WebState;
 // ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAiProviderConfigRequest {
+    pub provider: String,
+    pub config: AiConfig,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +83,8 @@ pub struct AiAgentStreamRequest {
     /// Defaults to "ask" if not provided.
     #[serde(default = "default_agent_mode")]
     pub mode: String,
+    #[serde(default)]
+    pub allow_write_sql: bool,
 }
 
 fn default_agent_mode() -> String {
@@ -86,6 +96,11 @@ fn reject_web_unsupported_ai_provider(config: &AiConfig) -> Result<(), AppError>
         return Err(AppError::bad_request("Codex CLI provider is only supported in DBX Desktop."));
     }
     Ok(())
+}
+
+fn ai_provider_from_key(provider: &str) -> Result<AiProvider, AppError> {
+    serde_json::from_value(serde_json::Value::String(provider.to_string()))
+        .map_err(|_| AppError::bad_request(format!("Invalid AI provider: {provider}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +119,25 @@ pub async fn save_ai_config(
 pub async fn load_ai_config(State(state): State<Arc<WebState>>) -> Result<Json<Option<AiConfig>>, AppError> {
     let config = state.app.storage.load_ai_config().await.map_err(AppError)?;
     Ok(Json(config))
+}
+
+pub async fn save_ai_provider_config(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<SaveAiProviderConfigRequest>,
+) -> Result<Json<()>, AppError> {
+    let parsed_provider = ai_provider_from_key(&body.provider)?;
+    let mut config = body.config;
+    config.provider = parsed_provider;
+    reject_web_unsupported_ai_provider(&config)?;
+    state.app.storage.save_ai_provider_config(&body.provider, &config).await.map_err(AppError)?;
+    Ok(Json(()))
+}
+
+pub async fn load_ai_provider_configs(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<HashMap<String, AiConfig>>, AppError> {
+    let configs = state.app.storage.load_ai_provider_configs().await.map_err(AppError)?;
+    Ok(Json(configs))
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +260,13 @@ pub async fn ai_agent_stream(
 
     let parsed_db_type: DatabaseType = serde_json::from_str(&format!("\"{}\"", body.db_type))
         .map_err(|_| AppError(format!("Unknown database type: {}", body.db_type)))?;
+    let production_database = state
+        .app
+        .configs
+        .read()
+        .await
+        .get(&body.connection_id)
+        .is_some_and(|config| dbx_core::production_safety::is_production_database(config, &body.database));
 
     let agent_ctx = AgentLoopContext {
         state: state.app.clone(),
@@ -233,6 +274,10 @@ pub async fn ai_agent_stream(
         database: body.database,
         db_type: parsed_db_type,
         cli_mcp_server_command: None,
+        sql_permissions: dbx_core::agent_tools::AgentSqlPermissions {
+            allow_writes: !production_database && body.allow_write_sql,
+            allow_dangerous: !production_database && body.allow_write_sql,
+        },
     };
 
     let sid = session_id.clone();
@@ -241,7 +286,6 @@ pub async fn ai_agent_stream(
     let req_messages = request.messages;
     let req_task_contract = request.task_contract;
     let req_max_tokens = request.max_tokens;
-    let req_temperature = request.temperature;
     let is_agent_mode = body.mode == "agent";
     let tx2 = tx.clone();
     tokio::task::spawn_blocking(move || {
@@ -259,7 +303,6 @@ pub async fn ai_agent_stream(
                 },
                 &cancelled,
                 req_max_tokens,
-                req_temperature,
                 req_task_contract.as_ref(),
                 is_agent_mode,
             )

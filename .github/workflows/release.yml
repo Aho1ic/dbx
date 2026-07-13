@@ -223,6 +223,37 @@ jobs:
           Compress-Archive -Path (Join-Path $portableDir "*") -DestinationPath $zipName -Force
           gh release upload "${env:GITHUB_REF_NAME}" $zipName --repo "${env:GITHUB_REPOSITORY}" --clobber
 
+      - name: Upload Windows WebView2 offline installer
+        if: matrix.arch == 'x64' || matrix.arch == 'arm64'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          $arch = "${{ matrix.arch }}"
+          $bundleDir = "target/${{ matrix.target }}/release/bundle/nsis"
+          $offlineName = "DBX_${version}_${arch}-webview2-offline-setup.exe"
+          $before = @{}
+
+          if (Test-Path $bundleDir) {
+            Get-ChildItem $bundleDir -Filter "*.exe" | ForEach-Object { $before[$_.FullName] = $_.LastWriteTimeUtc }
+          }
+
+          pnpm tauri bundle --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.webview2-offline.conf.json
+
+          $installer = Get-ChildItem $bundleDir -Filter "*.exe" |
+            Where-Object { !$before.ContainsKey($_.FullName) -or $_.LastWriteTimeUtc -gt $before[$_.FullName] } |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+
+          if (!$installer) {
+            Write-Error "Missing WebView2 offline installer in ${bundleDir}"
+            exit 1
+          }
+
+          Copy-Item $installer.FullName $offlineName -Force
+          gh release upload "${env:GITHUB_REF_NAME}" $offlineName --repo "${env:GITHUB_REPOSITORY}" --clobber
+
   cleanup-release-signatures:
     needs: build
     runs-on: ubuntu-latest
@@ -324,25 +355,83 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
-      - name: Sync release assets to CNB
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download GitHub release assets
         env:
           TAG_NAME: ${{ github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_USERNAME: ${{ github.repository_owner }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CNB_USERNAME: cnb
-          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/github-release" "$RUNNER_TEMP/release-assets"
+          gh release view "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
+            > "$RUNNER_TEMP/github-release/release.json"
+          gh release download "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-assets" \
+            --clobber
 
-          wget -q https://cnb.cool/znb/mpgrm/-/releases/download/v0.1.0/mpgrm_linux_amd64.tar.gz
-          tar -xf mpgrm_linux_amd64.tar.gz
-          chmod +x mpgrm
+      - name: Sync release assets to CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_UPLOAD_CONCURRENCY: "3"
+        run: |
+          node .github/scripts/sync-cnb-release.mjs \
+            --github-release "$RUNNER_TEMP/github-release/release.json" \
+            --assets-dir "$RUNNER_TEMP/release-assets"
 
-          ./mpgrm releases sync \
-            --repo "https://github.com/${GITHUB_REPOSITORY}.git" \
-            --target-repo "https://cnb.cool/${CNB_REPOSITORY}.git" \
-            --tags "${TAG_NAME}"
+  sync-release-to-atomgit:
+    name: Sync release to AtomGit
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Ensure AtomGit tag exists
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}" --force
+          git remote add atomgit "https://t8y2:${ATOMGIT_TOKEN}@atomgit.com/t8y2/dbx.git"
+          git push atomgit "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}" --force
+
+      - name: Download GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/github-release" "$RUNNER_TEMP/release-assets"
+          gh release view "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,name,body,targetCommitish,isPrerelease,isDraft,assets \
+            > "$RUNNER_TEMP/github-release/release.json"
+          gh release download "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/release-assets" \
+            --clobber
+
+      - name: Sync release assets to AtomGit
+        env:
+          ATOMGIT_TOKEN: ${{ secrets.ATOMGIT_TOKEN }}
+          ATOMGIT_REPOSITORY: "t8y2/dbx"
+          # AtomGit throttles concurrent large-asset uploads, which can expire their temporary upload URLs.
+          ATOMGIT_UPLOAD_CONCURRENCY: "1"
+        run: |
+          set -euo pipefail
+          node .github/scripts/sync-atomgit-release.mjs \
+            --github-release "$RUNNER_TEMP/github-release/release.json" \
+            --assets-dir "$RUNNER_TEMP/release-assets"
 
   docker:
     runs-on: ubuntu-latest

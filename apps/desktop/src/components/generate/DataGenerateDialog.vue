@@ -2,12 +2,13 @@
 import { reactive, ref, computed, onMounted, watch, type ComponentPublicInstance } from "vue";
 import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
-import * as api from "@/lib/api";
-import type { TableGenerateConfig } from "@/lib/dataGenerate";
-import { findGeneratorKey, generateTableData, defaultGeneratorParams } from "@/lib/dataGenerate";
-import { quoteTableIdentifier } from "@/lib/tableSelectSql";
-import { isTauriRuntime } from "@/lib/tauriRuntime";
-import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
+import * as api from "@/lib/backend/api";
+import type { TableGenerateConfig } from "@/lib/dataGrid/dataGenerate";
+import { displayGeneratedValue, findGeneratorKey, formatGeneratedValue, generateTableData, defaultGeneratorParams } from "@/lib/dataGrid/dataGenerate";
+import { quoteTableIdentifier } from "@/lib/table/tableSelectSql";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import GeneratorParamsPanel from "./params/GeneratorParamsPanel.vue";
 import type { ColumnInfo, TableInfo } from "@/types/database";
 
@@ -113,7 +114,7 @@ async function loadSchemas() {
               database: db,
               rowCount: 1000,
               columns: cols.map((c: ColumnInfo) => {
-                const isAI = c.extra === "auto_increment" || (c.column_default?.includes("nextval") ?? false);
+                const isAI = c.extra === "auto_increment" || (c.column_default?.toLowerCase().includes("nextval") ?? false);
                 const gKey = findGeneratorKey(c.name, c.data_type, isAI);
                 return {
                   columnName: c.name,
@@ -133,6 +134,7 @@ async function loadSchemas() {
                     gKey,
                   ),
                   isAutoIncrement: isAI,
+                  columnDefault: c.column_default,
                 };
               }),
             };
@@ -205,7 +207,7 @@ async function loadColumns(schema: string, table: string) {
     database: props.prefillDatabase,
     rowCount: 1000,
     columns: cols.map((c: ColumnInfo) => {
-      const isAI = c.extra === "auto_increment" || (c.column_default?.includes("nextval") ?? false);
+      const isAI = c.extra === "auto_increment" || (c.column_default?.toLowerCase().includes("nextval") ?? false);
       const gKey = findGeneratorKey(c.name, c.data_type, isAI);
       return {
         columnName: c.name,
@@ -225,6 +227,7 @@ async function loadColumns(schema: string, table: string) {
           gKey,
         ),
         isAutoIncrement: isAI,
+        columnDefault: c.column_default,
       };
     }),
   };
@@ -323,6 +326,10 @@ function onPreviewColResizeStart(ci: number, event: MouseEvent) {
   document.body.classList.add("select-none", "cursor-col-resize");
 }
 const currentPreview = computed(() => generatedResults.value[previewTableIndex.value] ?? { tableName: "", columns: [], rows: [], sql: "" });
+
+function displayPreviewCell(cell: unknown): string {
+  return displayGeneratedValue(cell);
+}
 
 async function fetchMaxValues(cfg: TableGenerateConfig): Promise<Record<string, number>> {
   const starts: Record<string, number> = {};
@@ -428,13 +435,7 @@ function sqlStatementsForTable(r: { tableName: string; columns: string[]; rows: 
   } else {
     const colList = r.columns.map((c) => quoteTableIdentifier(dbType.value, c)).join(", ");
     for (const row of r.rows) {
-      const vals = row
-        .map((v) => {
-          if (v === null || v === undefined) return "NULL";
-          if (typeof v === "number") return String(v);
-          return `'${String(v).replace(/'/g, "''")}'`;
-        })
-        .join(", ");
+      const vals = row.map(formatGeneratedValue).join(", ");
       stmts.push(`INSERT INTO ${quoteTableIdentifier(dbType.value, r.tableName)} (${colList}) VALUES (${vals});`);
     }
   }
@@ -450,40 +451,57 @@ async function startInsert() {
   const cid = props.prefillConnectionId;
   const db = props.prefillDatabase;
   if (!cid || !db) return;
-  executing.value = true;
-  const perTable: TableResult[] = [];
-  for (const r of generatedResults.value) {
-    const stmts = sqlStatementsForTable(r);
-    const rowCount = r.rows.length;
-    let ok = 0;
-    let lastError = "";
-    for (let si = 0; si < stmts.length; si++) {
-      try {
-        if (generateOptions.useTransaction) {
-          await api.executeInTransaction(cid, db, [stmts[si]], props.prefillSchema);
-        } else {
-          await api.executeQuery(cid, db, stmts[si], props.prefillSchema);
+  const sql = allSqlStatements().join("\n");
+  if (!sql.trim()) return;
+  try {
+    await executeWithProductionSqlGuard({
+      connection: store.getConfig(cid),
+      database: db,
+      sql,
+      source: t("production.sourceDataGenerate"),
+      execute: async () => {
+        executing.value = true;
+        const perTable: TableResult[] = [];
+        for (const r of generatedResults.value) {
+          const stmts = sqlStatementsForTable(r);
+          const rowCount = r.rows.length;
+          let ok = 0;
+          let lastError = "";
+          for (let si = 0; si < stmts.length; si++) {
+            try {
+              if (generateOptions.useTransaction) {
+                await api.executeInTransaction(cid, db, [stmts[si]], props.prefillSchema);
+              } else {
+                await api.executeQuery(cid, db, stmts[si], props.prefillSchema);
+              }
+              if (generateOptions.extendedInsert) {
+                ok = rowCount;
+              } else if (!(generateOptions.truncate && si === 0)) {
+                ok++;
+              }
+            } catch (e: unknown) {
+              const msg = e instanceof Error ? e.message : String(e);
+              console.error("[startInsert] SQL error:", msg);
+              if (!lastError) lastError = msg;
+              if (generateOptions.extendedInsert) {
+                ok = 0;
+              }
+              if (!generateOptions.continueOnError) break;
+            }
+          }
+          perTable.push({ table: r.tableName, total: rowCount, ok, err: rowCount - ok, error: lastError || undefined });
+          if (ok > 0) {
+            store.invalidateMetadataCache(cid, db, props.prefillSchema || undefined, r.tableName);
+          }
         }
-        if (generateOptions.extendedInsert) {
-          ok = rowCount;
-        } else if (!(generateOptions.truncate && si === 0)) {
-          ok++;
-        }
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.error("[startInsert] SQL error:", msg);
-        if (!lastError) lastError = msg;
-        if (generateOptions.extendedInsert) {
-          ok = 0;
-        }
-        if (!generateOptions.continueOnError) break;
-      }
-    }
-    perTable.push({ table: r.tableName, total: rowCount, ok, err: rowCount - ok, error: lastError || undefined });
+        executeResults.value = perTable;
+        currentStep.value = "result";
+        return true;
+      },
+    });
+  } finally {
+    executing.value = false;
   }
-  executeResults.value = perTable;
-  currentStep.value = "result";
-  executing.value = false;
 }
 
 const orderDialogOpen = ref(false);
@@ -868,7 +886,7 @@ async function onFileSelected(event: Event) {
                         :style="{ maxWidth: (previewColWidths[ci] ?? 120) + 'px' }"
                         :class="{ 'text-muted-foreground italic': cell === null || cell === undefined }"
                       >
-                        {{ cell === null || cell === undefined ? "NULL" : String(cell) }}
+                        {{ displayPreviewCell(cell) }}
                       </td>
                     </tr>
                   </tbody>

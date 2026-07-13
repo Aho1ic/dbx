@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -43,6 +45,119 @@ func TestHandshakeResponse(t *testing.T) {
 	}
 	if !contains(result.Capabilities, "query") || !contains(result.Capabilities, "metadata") {
 		t.Fatalf("expected query and metadata capabilities, got %v", result.Capabilities)
+	}
+}
+
+func TestRuntimeHandshakeAdvertisesMultiSessionProtocol(t *testing.T) {
+	runtime := newRuntimeServer()
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":7,"method":"handshake","params":{}}`)
+	if shutdown || resp.Error != nil {
+		t.Fatalf("unexpected handshake response: shutdown=%v error=%v", shutdown, resp.Error)
+	}
+	data, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		ProtocolVersion int      `json:"protocolVersion"`
+		Capabilities    []string `json:"capabilities"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.ProtocolVersion != multiSessionProtocolVersion || !contains(result.Capabilities, "multi_session") {
+		t.Fatalf("unexpected runtime handshake: %+v", result)
+	}
+}
+
+func TestRuntimeMissingAgentSessionDoesNotUseQueryCursorSessionID(t *testing.T) {
+	runtime := newRuntimeServer()
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":8,"method":"fetch_query_page","params":{"sessionId":"cursor-1"}}`)
+	if shutdown {
+		t.Fatal("fetch_query_page should not shut down the runtime")
+	}
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, legacyAgentSessionID) {
+		t.Fatalf("expected missing legacy agent session error, got %#v", resp.Error)
+	}
+}
+
+func TestRuntimeCloseOneSessionKeepsOtherSessionRegistered(t *testing.T) {
+	runtime := newRuntimeServer()
+	runtime.sessions["a"] = &agentSession{server: newServer()}
+	runtime.sessions["b"] = &agentSession{server: newServer()}
+
+	if err := runtime.closeSession("a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.session("a"); err == nil {
+		t.Fatal("closed session should be removed")
+	}
+	if _, err := runtime.session("b"); err != nil {
+		t.Fatalf("other session should remain registered: %v", err)
+	}
+}
+
+func TestRuntimeCancelSessionOnlyCancelsTargetSession(t *testing.T) {
+	runtime := newRuntimeServer()
+	serverA := newServer()
+	serverB := newServer()
+	ctxA, cancelA := context.WithCancel(context.Background())
+	ctxB, cancelB := context.WithCancel(context.Background())
+	serverA.activeCancel = cancelA
+	serverB.activeCancel = cancelB
+	runtime.sessions["a"] = &agentSession{server: serverA}
+	runtime.sessions["b"] = &agentSession{server: serverB}
+
+	resp, shutdown := runtime.handleLine(`{"jsonrpc":"2.0","id":9,"method":"cancel_session","params":{"agentSessionId":"a"}}`)
+	if shutdown || resp.Error != nil {
+		t.Fatalf("unexpected cancel response: shutdown=%v error=%v", shutdown, resp.Error)
+	}
+	select {
+	case <-ctxA.Done():
+	default:
+		t.Fatal("target session was not canceled")
+	}
+	select {
+	case <-ctxB.Done():
+		t.Fatal("canceling session a should not cancel session b")
+	default:
+	}
+	cancelB()
+}
+
+func TestRuntimeRejectsSessionsBeyondLimit(t *testing.T) {
+	runtime := newRuntimeServer()
+	for index := 0; index < maxAgentSessions; index++ {
+		runtime.sessions[fmt.Sprintf("session-%d", index)] = &agentSession{server: newServer()}
+	}
+	err := runtime.openSession("overflow", connectParams{})
+	if err == nil || !strings.Contains(err.Error(), "session limit") {
+		t.Fatalf("expected session limit error, got %v", err)
+	}
+}
+
+func TestNewXuguDatabaseSessionFindsOnlyNewSession(t *testing.T) {
+	existing := xuguDatabaseSession{nodeID: 1, sessionID: 10}
+	created := xuguDatabaseSession{nodeID: 1, sessionID: 11}
+	result, err := newXuguDatabaseSession(
+		map[xuguDatabaseSession]struct{}{existing: {}},
+		map[xuguDatabaseSession]struct{}{existing: {}, created: {}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != created {
+		t.Fatalf("unexpected session: %+v", result)
+	}
+}
+
+func TestXuguSessionAppNameIsStableAndDoesNotExposeSessionID(t *testing.T) {
+	name := xuguSessionAppName("tab-session-secret")
+	if name != xuguSessionAppName("tab-session-secret") {
+		t.Fatal("app name should be stable")
+	}
+	if strings.Contains(name, "tab-session-secret") || !strings.HasPrefix(name, "DBX_") {
+		t.Fatalf("unexpected app name: %s", name)
 	}
 }
 
@@ -380,6 +495,73 @@ func TestXuguMetadataAccessErrorDetection(t *testing.T) {
 	}
 	if isXuguMetadataAccessError(errors.New("network timeout")) {
 		t.Fatal("network errors should not trigger database-list fallback")
+	}
+}
+
+func TestXuguListTablesQueryAppliesMetadataConstraints(t *testing.T) {
+	query := xuguListTablesQuery("APP", metadataListConstraints{
+		Filter:      "ord_",
+		ObjectTypes: []string{"view", "table", "VIEW"},
+		Limit:       25,
+		Offset:      50,
+	})
+
+	for _, want := range []string{
+		"UPPER(TABLE_NAME) LIKE ? ESCAPE '\\'",
+		"TABLE_TYPE IN (?,?)",
+		"ORDER BY TABLE_TYPE, TABLE_NAME",
+		"ROWNUM <= ?",
+		"DBX_RN > ?",
+	} {
+		if !strings.Contains(query.SQL, want) {
+			t.Fatalf("expected SQL to contain %q:\n%s", want, query.SQL)
+		}
+	}
+
+	wantArgs := []any{"APP", "APP", `%O%R%D%\_%`, "TABLE", "VIEW", 75, 50}
+	assertArgs(t, query.Args, wantArgs)
+}
+
+func TestXuguListObjectsQueryRejectsUnsupportedObjectTypes(t *testing.T) {
+	query := xuguListObjectsQuery("APP", metadataListConstraints{
+		ObjectTypes: []string{"INDEX"},
+		Limit:       10,
+	})
+
+	if !strings.Contains(query.SQL, "1 = 0") {
+		t.Fatalf("unsupported object type should produce empty-result predicate:\n%s", query.SQL)
+	}
+
+	wantArgs := []any{"APP", "APP", 10, 0}
+	assertArgs(t, query.Args, wantArgs)
+}
+
+func TestMetadataListConstraintsFromParams(t *testing.T) {
+	params := map[string]json.RawMessage{
+		"filter":       json.RawMessage(`"tab"`),
+		"limit":        json.RawMessage(`30`),
+		"offset":       json.RawMessage(`5`),
+		"object_types": json.RawMessage(`["TABLE","VIEW"]`),
+	}
+
+	constraints := metadataListConstraintsFromParams(params)
+	if constraints.Filter != "tab" || constraints.Limit != 30 || constraints.Offset != 5 {
+		t.Fatalf("unexpected constraints: %+v", constraints)
+	}
+	if len(constraints.ObjectTypes) != 2 || constraints.ObjectTypes[0] != "TABLE" || constraints.ObjectTypes[1] != "VIEW" {
+		t.Fatalf("unexpected object types: %+v", constraints.ObjectTypes)
+	}
+}
+
+func assertArgs(t *testing.T, got []any, want []any) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("args length = %d, want %d: got=%#v want=%#v", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("arg %d = %#v, want %#v; args=%#v", i, got[i], want[i], got)
+		}
 	}
 }
 

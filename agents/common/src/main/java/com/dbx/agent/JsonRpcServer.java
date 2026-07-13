@@ -1,15 +1,20 @@
 package com.dbx.agent;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonSerializer;
 import com.google.gson.reflect.TypeToken;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Type;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.Connection;
 import java.util.Collections;
 import java.util.List;
@@ -18,12 +23,24 @@ public final class JsonRpcServer {
     private static final long CONNECTION_VALIDATION_INTERVAL_MILLIS = 5_000L;
 
     private final DatabaseAgent agent;
-    private final Gson gson = new Gson();
+    private final JdbcExecutor jdbcExecutor;
+    private final Gson gson = new GsonBuilder()
+        // JDBC DECIMAL/NUMERIC values can exceed JavaScript Number precision after JSON-RPC parsing.
+        .registerTypeAdapter(
+            BigDecimal.class,
+            (JsonSerializer<BigDecimal>) (value, type, context) -> new JsonPrimitive(value.toPlainString())
+        )
+        .registerTypeAdapter(
+            BigInteger.class,
+            (JsonSerializer<BigInteger>) (value, type, context) -> new JsonPrimitive(value.toString())
+        )
+        .create();
     private ConnectParams lastConnectParams;
     private long lastConnectionValidationTimeMillis;
 
     public JsonRpcServer(DatabaseAgent agent) {
         this.agent = agent;
+        this.jdbcExecutor = new JdbcExecutor();
     }
 
     public void run() {
@@ -69,6 +86,14 @@ public final class JsonRpcServer {
         }
     }
 
+    Object dispatchForRuntime(String method, JsonObject params) throws Exception {
+        return AgentExecutionContext.withJdbcExecutor(jdbcExecutor, () -> dispatch(method, params));
+    }
+
+    void cancelActiveStatements() {
+        jdbcExecutor.cancelActiveStatements();
+    }
+
     private Object dispatch(String method, JsonObject params) throws Exception {
         if (AgentProtocol.METHOD_HANDSHAKE.equals(method)) {
             return AgentProtocol.handshakeResult();
@@ -100,6 +125,9 @@ public final class JsonRpcServer {
             return Collections.singletonMap("ok", true);
         }
         ensureLiveConnection(method);
+        if (AgentProtocol.METHOD_CONNECTION_INFO.equals(method)) {
+            return Collections.singletonMap("identifierQuote", agent.getIdentifierQuote());
+        }
         if (AgentProtocol.METHOD_LIST_DATABASES.equals(method)) {
             return agent.listDatabases();
         }
@@ -109,11 +137,11 @@ public final class JsonRpcServer {
         }
         if (AgentProtocol.METHOD_LIST_TABLES.equals(method)) {
             switchCatalog(params);
-            return agent.listTables(params.get("schema").getAsString(), stringListOrNull(params, "object_types"));
+            return agent.listTables(params.get("schema").getAsString(), metadataListConstraints(params));
         }
         if (AgentProtocol.METHOD_LIST_OBJECTS.equals(method)) {
             switchCatalog(params);
-            return agent.listObjects(params.get("schema").getAsString());
+            return agent.listObjects(params.get("schema").getAsString(), metadataListConstraints(params));
         }
         if (AgentProtocol.METHOD_LIST_DATA_TYPES.equals(method)) {
             switchCatalog(params);
@@ -228,18 +256,17 @@ public final class JsonRpcServer {
             return agent.executeBatch(statements, stringOrNull(params, "schema"));
         }
         if (AgentProtocol.METHOD_DISCONNECT.equals(method)) {
-            JdbcExecutor.INSTANCE.closeAllQuerySessions();
-            JdbcExecutor.INSTANCE.closeAllTableReadSessions();
+            jdbcExecutor.closeAllQuerySessions();
+            jdbcExecutor.closeAllTableReadSessions();
             agent.disconnect();
             lastConnectParams = null;
             return Collections.singletonMap("ok", true);
         }
         if (AgentProtocol.METHOD_SHUTDOWN.equals(method)) {
-            JdbcExecutor.INSTANCE.closeAllQuerySessions();
-            JdbcExecutor.INSTANCE.closeAllTableReadSessions();
+            jdbcExecutor.closeAllQuerySessions();
+            jdbcExecutor.closeAllTableReadSessions();
             agent.disconnect();
             lastConnectParams = null;
-            System.exit(0);
             return Collections.singletonMap("ok", true);
         }
         throw new IllegalArgumentException("Unknown method: " + method);
@@ -285,8 +312,8 @@ public final class JsonRpcServer {
             return;
         }
 
-        JdbcExecutor.INSTANCE.closeAllQuerySessions();
-        JdbcExecutor.INSTANCE.closeAllTableReadSessions();
+        jdbcExecutor.closeAllQuerySessions();
+        jdbcExecutor.closeAllTableReadSessions();
         try {
             agent.disconnect();
         } catch (Exception ignored) {
@@ -339,6 +366,15 @@ public final class JsonRpcServer {
             return null;
         }
         return element.getAsInt();
+    }
+
+    private MetadataListConstraints metadataListConstraints(JsonObject params) {
+        return new MetadataListConstraints(
+            stringOrNull(params, "filter"),
+            intOrNull(params, "limit"),
+            intOrNull(params, "offset"),
+            stringListOrNull(params, "object_types")
+        );
     }
 
     private static int intOrDefault(JsonObject object, String key, int defaultValue) {
