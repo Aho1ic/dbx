@@ -1,8 +1,11 @@
 use crate::models::connection::DatabaseType;
 
-use super::capabilities::{firebird_rows_clause, table_pagination_strategy, uses_fetch_first, TablePaginationStrategy};
+use super::capabilities::{
+    firebird_rows_clause, table_pagination_strategy, uses_oracle_row_id, TablePaginationStrategy,
+};
 use super::identifiers::{
-    normalize_where_input, qualified_table_name, qualified_table_name_with_catalog, quote_table_identifier,
+    normalize_where_input, qualified_table_name, qualified_table_name_with_catalog, quote_gaussdb_jdbc_identifier,
+    quote_table_identifier,
 };
 use super::types::{
     TableDataSelectSqlOptions, TableSelectSqlOptions, DBX_NEO4J_ELEMENT_ID_COLUMN, DBX_ROWID_COLUMN,
@@ -21,7 +24,7 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     }
 
     // Doris / StarRocks multi-catalog: prefix the catalog for external-catalog tables.
-    let table = if database_type == Some(DatabaseType::Kingbase) {
+    let table = if uses_connection_identifier_quote(database_type, options.identifier_quote.as_deref()) {
         table_data_qualified_table_name(
             database_type,
             options.schema.as_deref(),
@@ -50,8 +53,11 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     // Oracle join views can raise ORA-01445 when ROWID is selected; keep the
     // synthetic ROWID fallback scoped to base-table reads.
     let include_oracle_row_id = options.include_row_id
-        && database_type == Some(DatabaseType::Oracle)
+        && uses_oracle_row_id(database_type)
         && !is_view_table_type(options.table_type.as_deref());
+    let offset = options.offset.unwrap_or(0);
+    let oracle_view_first_page =
+        database_type == Some(DatabaseType::Oracle) && is_view_table_type(options.table_type.as_deref()) && offset == 0;
 
     let select_columns = if include_oracle_row_id {
         format!("ROWIDTOCHAR(t.ROWID) AS \"{DBX_ROWID_COLUMN}\", t.*")
@@ -72,8 +78,7 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     } else {
         rownum_select_columns.clone()
     };
-    let table_alias =
-        if include_oracle_row_id && database_type.is_some_and(uses_fetch_first) { format!("{table} t") } else { table };
+    let table_alias = if include_oracle_row_id { format!("{table} t") } else { table };
 
     match table_pagination_strategy(database_type) {
         TablePaginationStrategy::IrisTop => {
@@ -108,6 +113,9 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
             )
         }
         TablePaginationStrategy::Rownum => {
+            if oracle_view_first_page {
+                return format!("SELECT {page_select_columns} FROM {table_alias}{where_clause}{order}");
+            }
             let rownum_inner_select_columns =
                 if include_oracle_row_id { &select_columns } else { &rownum_select_columns };
             build_rownum_table_select_sql(
@@ -117,7 +125,7 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
                 rownum_inner_select_columns,
                 &page_select_columns,
                 limit,
-                options.offset.unwrap_or(0),
+                offset,
             )
         }
         TablePaginationStrategy::Unbounded => {
@@ -159,7 +167,7 @@ pub(crate) fn table_data_qualified_table_name(
     table_name: &str,
     identifier_quote: Option<&str>,
 ) -> String {
-    if database_type != Some(DatabaseType::Kingbase) {
+    if !uses_connection_identifier_quote(database_type, identifier_quote) {
         return qualified_table_name(database_type, schema, table_name);
     }
     let table = quote_table_data_identifier(database_type, table_name, identifier_quote);
@@ -170,21 +178,33 @@ pub(crate) fn table_data_qualified_table_name(
         .unwrap_or(table)
 }
 
-fn quote_table_data_identifier(
+pub(crate) fn quote_table_data_identifier(
     database_type: Option<DatabaseType>,
     name: &str,
     identifier_quote: Option<&str>,
 ) -> String {
-    if database_type != Some(DatabaseType::Kingbase) {
+    if !uses_connection_identifier_quote(database_type, identifier_quote) {
         return quote_table_identifier(database_type, name);
     }
     let Some(quote) = identifier_quote else {
         return quote_table_identifier(database_type, name);
     };
+    if matches!(database_type, Some(DatabaseType::Gaussdb | DatabaseType::OpenGauss | DatabaseType::Postgres)) {
+        return quote_gaussdb_jdbc_identifier(name, quote);
+    }
     if quote.is_empty() {
         return name.to_string();
     }
     format!("{quote}{}{quote}", name.replace(quote, &format!("{quote}{quote}")))
+}
+
+pub(crate) fn uses_connection_identifier_quote(
+    database_type: Option<DatabaseType>,
+    identifier_quote: Option<&str>,
+) -> bool {
+    database_type == Some(DatabaseType::Kingbase)
+        || (matches!(database_type, Some(DatabaseType::Gaussdb | DatabaseType::OpenGauss | DatabaseType::Postgres))
+            && identifier_quote.is_some())
 }
 
 fn is_view_table_type(table_type: Option<&str>) -> bool {

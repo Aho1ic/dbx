@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import type { ColumnInfo, ForeignKeyInfo, IndexInfo, QueryTab, TriggerInfo } from "@/types/database";
 import * as api from "@/lib/backend/api";
 import { copyToClipboard } from "@/lib/common/clipboard";
+import { tableColumnDefaultDisplayValue } from "@/lib/table/tableColumnDefaultPresentation";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 
 type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
@@ -246,7 +247,7 @@ function toggleDdlWrap() {
           <tr class="border-b">
             <th class="text-left font-medium px-3 py-2 w-[28%]">{{ t("grid.columnName") }}</th>
             <th class="text-left font-medium px-3 py-2 w-[22%]">{{ t("grid.columnType") }}</th>
-            <th class="text-left font-medium px-3 py-2 w-[22%]">{{ t("grid.tableInfoDefault") }}</th>
+            <th class="text-left font-medium px-3 py-2 w-[22%]">{{ t("structureEditor.defaultValue") }}</th>
             <th class="text-left font-medium px-3 py-2 w-[28%]">{{ t("grid.columnComment") }}</th>
           </tr>
         </thead>
@@ -259,8 +260,8 @@ function toggleDdlWrap() {
               </span>
             </td>
             <td class="px-3 py-2 font-mono text-[11px] text-muted-foreground truncate" :title="column.is_nullable ? column.data_type : column.data_type + ' NOT NULL'">{{ column.data_type }}<span v-if="!column.is_nullable" class="ml-1 opacity-70">NOT NULL</span></td>
-            <td class="px-3 py-2 font-mono text-[11px] text-muted-foreground truncate" :title="column.column_default ?? ''">
-              {{ column.column_default ?? "" }}
+            <td data-table-info-column-default class="max-w-56 px-3 py-2 font-mono text-[11px]" :class="{ 'text-muted-foreground/70': column.column_default == null }" :title="column.column_default ?? undefined">
+              <span class="block max-w-56 truncate">{{ tableColumnDefaultDisplayValue(column.column_default) }}</span>
             </td>
             <td class="px-3 py-2 text-[11px] text-muted-foreground truncate" :title="column.comment ?? ''">
               {{ column.comment ?? "" }}

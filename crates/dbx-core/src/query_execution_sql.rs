@@ -53,6 +53,9 @@ pub fn build_explain_sql(options: ExplainSqlOptions) -> ExplainSqlBuildResult {
     if !is_safe_explain_sql(&source) {
         return explain_err("unsafe");
     }
+    if options.database_type == Some(DatabaseType::SqlServer) && crate::sql::split_sql_batches(&source).len() != 1 {
+        return explain_err("unsafe");
+    }
 
     let sql = match options.database_type {
         Some(DatabaseType::Postgres | DatabaseType::MongoDb) => {
@@ -62,6 +65,9 @@ pub fn build_explain_sql(options: ExplainSqlOptions) -> ExplainSqlBuildResult {
             format!("EXPLAIN {source}")
         }
         Some(DatabaseType::Oracle) => format!("EXPLAIN PLAN FOR {source}"),
+        Some(DatabaseType::SqlServer) => {
+            format!("SET SHOWPLAN_XML ON;\nGO\n{source}\nGO\nSET SHOWPLAN_XML OFF;")
+        }
         Some(DatabaseType::Mysql) if options.format == Some(ExplainFormat::Standard) => {
             // MySQL 8.0.32+ may otherwise inherit TREE or JSON from the session-level explain_format.
             format!("EXPLAIN FORMAT=TRADITIONAL {source}")
@@ -99,6 +105,7 @@ pub fn supports_explain_plan(database_type: Option<DatabaseType>) -> bool {
                 | DatabaseType::Questdb
                 | DatabaseType::Dameng
                 | DatabaseType::Oracle
+                | DatabaseType::SqlServer
         )
     )
 }
@@ -119,6 +126,7 @@ pub fn supports_sql_query(database_type: DatabaseType) -> bool {
         DatabaseType::Redis
             | DatabaseType::MongoDb
             | DatabaseType::Elasticsearch
+            | DatabaseType::Easysearch
             | DatabaseType::Qdrant
             | DatabaseType::Milvus
             | DatabaseType::Weaviate
@@ -198,10 +206,91 @@ pub fn is_write_sql(sql: &str) -> bool {
 /// executable comments and file exports, plus PostgreSQL-family/SQL Server
 /// `SELECT ... INTO` table creation.
 pub fn is_write_sql_for_database(sql: &str, database_type: DatabaseType) -> bool {
+    if let Some(risk) = classify_search_engine_query_risk(sql, database_type) {
+        return risk != SearchEngineQueryRisk::ReadOnly;
+    }
     is_write_sql_with_database_type(sql, Some(database_type))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchEngineQueryRisk {
+    ReadOnly,
+    Write,
+    Dangerous,
+}
+
+pub(crate) fn classify_search_engine_query_risk(
+    source: &str,
+    database_type: DatabaseType,
+) -> Option<SearchEngineQueryRisk> {
+    if !matches!(database_type, DatabaseType::Elasticsearch | DatabaseType::Easysearch) {
+        return None;
+    }
+    let source = strip_leading_search_engine_comments(source);
+    let request_line = source.lines().next()?.trim();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_ascii_uppercase();
+    let path = parts.next()?;
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    let segments = path.split('/').filter(|segment| !segment.is_empty()).collect::<Vec<_>>();
+    let has_segment = |candidate: &str| segments.iter().any(|segment| segment.eq_ignore_ascii_case(candidate));
+    let has_document_id = |candidate: &str| {
+        segments
+            .iter()
+            .position(|segment| segment.eq_ignore_ascii_case(candidate))
+            .is_some_and(|index| segments.get(index + 1).is_some_and(|value| !value.is_empty()))
+    };
+
+    match method.as_str() {
+        "GET" | "HEAD" | "OPTIONS" => Some(SearchEngineQueryRisk::ReadOnly),
+        "POST"
+            if [
+                "_search",
+                "_count",
+                "_sql",
+                "_msearch",
+                "_field_caps",
+                "_terms_enum",
+                "_validate",
+                "_explain",
+                "_rank_eval",
+                "_search_shards",
+            ]
+            .iter()
+            .any(|endpoint| has_segment(endpoint)) =>
+        {
+            Some(SearchEngineQueryRisk::ReadOnly)
+        }
+        "POST" if ["_doc", "_create", "_update", "_bulk"].iter().any(|endpoint| has_segment(endpoint)) => {
+            Some(SearchEngineQueryRisk::Write)
+        }
+        "PUT" if has_document_id("_doc") || has_document_id("_create") => Some(SearchEngineQueryRisk::Write),
+        "DELETE" if has_document_id("_doc") => Some(SearchEngineQueryRisk::Write),
+        "POST" | "PUT" | "PATCH" | "DELETE" => Some(SearchEngineQueryRisk::Dangerous),
+        _ => None,
+    }
+}
+
+fn strip_leading_search_engine_comments(input: &str) -> &str {
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if let Some(comment) = rest.strip_prefix('#').or_else(|| rest.strip_prefix("//")) {
+            rest = comment.split_once('\n').map_or("", |(_, remaining)| remaining);
+            continue;
+        }
+        if let Some(comment) = rest.strip_prefix("/*") {
+            rest = comment.split_once("*/").map_or("", |(_, remaining)| remaining);
+            continue;
+        }
+        return rest.trim();
+    }
+}
+
 fn is_write_sql_with_database_type(sql: &str, database_type: Option<DatabaseType>) -> bool {
+    if database_type == Some(DatabaseType::SqlServer) && is_sqlserver_showplan_xml_set(sql) {
+        return false;
+    }
     if database_type.is_some_and(|database_type| has_dialect_specific_write(sql, database_type)) {
         return true;
     }
@@ -218,6 +307,14 @@ fn is_write_sql_with_database_type(sql: &str, database_type: Option<DatabaseType
     statements
         .iter()
         .any(|statement| is_write_sql_statement(statement, detect_mysql_executable_comments, detect_select_into))
+}
+
+fn is_sqlserver_showplan_xml_set(sql: &str) -> bool {
+    let normalized = strip_sql_comments(sql)
+        .split_whitespace()
+        .map(|part| part.trim_end_matches(';').to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    matches!(normalized.as_slice(), [set, showplan, value] if set == "SET" && showplan == "SHOWPLAN_XML" && matches!(value.as_str(), "ON" | "OFF"))
 }
 
 fn is_mysql_compatible_database(database_type: DatabaseType) -> bool {
@@ -240,6 +337,7 @@ fn is_postgresql_family_database(database_type: DatabaseType) -> bool {
             | DatabaseType::OpenGauss
             | DatabaseType::Kingbase
             | DatabaseType::Highgo
+            | DatabaseType::Uxdb
             | DatabaseType::Vastbase
             | DatabaseType::Kwdb
     )
@@ -456,7 +554,7 @@ fn has_extra_statement_after_semicolon(sql: &str) -> bool {
     stripped.split(';').skip(1).any(|part| !part.trim().is_empty())
 }
 
-fn strip_sql_comments(sql: &str) -> String {
+pub(crate) fn strip_sql_comments(sql: &str) -> String {
     let mut output = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     let mut in_line_comment = false;
@@ -713,6 +811,44 @@ mod tests {
                 sql: Some("EXPLAIN PLAN FOR WITH rows AS (SELECT 1 AS id FROM dual) SELECT * FROM rows".to_string()),
                 reason: None,
             }
+        );
+    }
+
+    #[test]
+    fn builds_sqlserver_showplan_xml_batches() {
+        let result = build_explain_sql(ExplainSqlOptions {
+            database_type: Some(DatabaseType::SqlServer),
+            format: None,
+            sql: "WITH rows AS (SELECT 1 AS id) SELECT * FROM rows;".to_string(),
+        });
+
+        assert_eq!(
+            result,
+            ExplainSqlBuildResult {
+                ok: true,
+                sql: Some(
+                    "SET SHOWPLAN_XML ON;\nGO\nWITH rows AS (SELECT 1 AS id) SELECT * FROM rows\nGO\nSET SHOWPLAN_XML OFF;"
+                        .to_string()
+                ),
+                reason: None,
+            }
+        );
+
+        assert_eq!(
+            build_explain_sql(ExplainSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                format: None,
+                sql: "SELECT 1\nGO\nSELECT 2".to_string(),
+            }),
+            ExplainSqlBuildResult { ok: false, sql: None, reason: Some("unsafe".to_string()) }
+        );
+        assert!(
+            build_explain_sql(ExplainSqlOptions {
+                database_type: Some(DatabaseType::SqlServer),
+                format: None,
+                sql: "SELECT 'first line\nGO\nlast line' AS text".to_string(),
+            })
+            .ok
         );
     }
 
@@ -1145,6 +1281,16 @@ mod tests {
     }
 
     #[test]
+    fn check_read_only_allows_only_sqlserver_showplan_xml_session_switches() {
+        for sql in ["SET SHOWPLAN_XML ON;", "-- explain\nSET SHOWPLAN_XML OFF"] {
+            assert_eq!(check_read_only(sql, "readonly", DatabaseType::SqlServer), Ok(()));
+        }
+        assert!(check_read_only("SET SHOWPLAN_ALL ON", "readonly", DatabaseType::SqlServer).is_err());
+        assert!(check_read_only("SET SHOWPLAN_XML ON; SELECT 1", "readonly", DatabaseType::SqlServer).is_err());
+        assert!(check_read_only("SET SHOWPLAN_XML OFF; DROP TABLE users", "readonly", DatabaseType::SqlServer).is_err());
+    }
+
+    #[test]
     fn check_read_only_only_treats_executable_comments_as_writes_for_mysql_compatible_connections() {
         let mysql_executable_comment = "SELECT 3156 /*!50000 INTO OUTFILE '/var/lib/mysql-files/dbx_ro_probe.txt' */";
         let mariadb_executable_comment =
@@ -1190,5 +1336,18 @@ mod tests {
         // strip_sql_comments does NOT handle string delimiters, so it strips
         // comments even inside string literals
         assert_eq!(strip_sql_comments("SELECT 'hello /* not a comment */'"), "SELECT 'hello  '");
+    }
+
+    #[test]
+    fn classifies_search_engine_rest_writes() {
+        assert!(!is_write_sql_for_database("GET /_cluster/health", DatabaseType::Easysearch));
+        assert!(!is_write_sql_for_database(
+            "POST /products/_search\n{\"query\":{\"match_all\":{}}}",
+            DatabaseType::Easysearch
+        ));
+        assert!(is_write_sql_for_database(
+            "PUT /products/_doc/1?refresh=true\n{\"name\":\"Notebook\"}",
+            DatabaseType::Easysearch
+        ));
     }
 }

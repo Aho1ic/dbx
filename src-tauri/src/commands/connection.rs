@@ -8,17 +8,25 @@ pub use dbx_core::agent_connection::{
 };
 pub use dbx_core::connection::{
     agent_connect_timeout, connect_bare_metadata_pool, connect_mysql_metadata_pool, connection_url_for_endpoint,
-    metadata_connection_config, prestosql_jdbc_config_for_endpoint, probe_connection_endpoint,
-    redacted_connection_url_for_endpoint, AppState, MysqlMode, PoolKind,
+    gaussdb_m_jdbc_config_for_endpoint, gaussdb_uses_m_jdbc_driver, metadata_connection_config,
+    prestosql_jdbc_config_for_endpoint, probe_connection_endpoint, redacted_connection_url_for_endpoint, AppState,
+    MysqlMode, PoolKind,
 };
 use dbx_core::database_capabilities;
 use dbx_core::db;
 use dbx_core::db::agent_driver::AgentMethod;
-use dbx_core::models::connection::{rewrite_jdbc_url_host, ConnectionConfig, DatabaseType};
+use dbx_core::models::connection::{
+    database_info_from_protocol_value, rewrite_jdbc_url_host, ConnectionConfig, ConnectionTestResult,
+    DatabaseConnectionInfo, DatabaseType,
+};
 pub use dbx_core::path_utils::expand_tilde;
 
 const MONGO_LEGACY_DRIVER_PROFILE: &str = "mongodb-legacy";
 const MONGO_LEGACY_DRIVER_LABEL: &str = "MongoDB (Legacy)";
+
+fn gaussdb_m_jdbc_command_config(config: &ConnectionConfig, host: &str, port: u16) -> Option<ConnectionConfig> {
+    gaussdb_uses_m_jdbc_driver(config).then(|| gaussdb_m_jdbc_config_for_endpoint(config, host, port))
+}
 
 fn mongo_legacy_connect_params(config: &ConnectionConfig, host: &str, port: u16) -> serde_json::Value {
     serde_json::json!({
@@ -37,20 +45,18 @@ fn mark_mongo_legacy_driver(config: &mut ConnectionConfig) -> bool {
     changed
 }
 
-async fn persist_mongo_legacy_driver_profile(state: &AppState, config: &ConnectionConfig) -> Result<(), String> {
+async fn persist_mongo_legacy_driver_profile(state: &AppState, config: &ConnectionConfig) -> Result<bool, String> {
     if config.one_time {
-        return Ok(());
+        return Ok(true);
     }
-
-    let mut configs: Vec<ConnectionConfig> =
-        state.storage.load_connections().await?.into_iter().map(|config| config.canonicalized()).collect();
-    let Some(saved_config) = configs.iter_mut().find(|saved_config| saved_config.id == config.id) else {
-        return Ok(());
-    };
-    if !mark_mongo_legacy_driver(saved_config) {
-        return Ok(());
-    }
-    save_connection_configs(state, &configs).await
+    state
+        .storage
+        .save_connection_driver_profile(
+            config,
+            Some(MONGO_LEGACY_DRIVER_PROFILE.to_string()),
+            Some(MONGO_LEGACY_DRIVER_LABEL.to_string()),
+        )
+        .await
 }
 
 async fn test_agent_connection(
@@ -58,7 +64,7 @@ async fn test_agent_connection(
     config: &ConnectionConfig,
     host: &str,
     port: u16,
-) -> Result<String, String> {
+) -> Result<ConnectionTestResult, String> {
     let connect_params = agent_connect_params(config, host, port, config.database.as_deref().unwrap_or(""));
     let result = state
         .agent_manager
@@ -71,32 +77,49 @@ async fn test_agent_connection(
         )
         .await;
 
-    if let Err(err) = result {
-        if let Some(alternate_config) = oracle_alternate_connect_config(config, &err) {
-            state
-                .agent_manager
-                .call_daemon_method_with_timeout::<serde_json::Value>(
-                    &alternate_config.db_type,
-                    alternate_config.driver_profile.as_deref(),
-                    AgentMethod::TestConnection,
-                    agent_connect_params(
-                        &alternate_config,
-                        host,
-                        port,
-                        alternate_config.database.as_deref().unwrap_or(""),
-                    ),
-                    Some(agent_connect_timeout(&alternate_config)),
-                )
-                .await
-                .map_err(|alternate_err| {
-                    format!("{err}\n\nFallback with alternate Oracle descriptor failed: {alternate_err}")
-                })?;
-        } else {
-            return Err(oracle_error_with_driver_hint(config, &err));
+    let response = match result {
+        Ok(response) => response,
+        Err(err) => {
+            if let Some(alternate_config) = oracle_alternate_connect_config(config, &err) {
+                state
+                    .agent_manager
+                    .call_daemon_method_with_timeout::<serde_json::Value>(
+                        &alternate_config.db_type,
+                        alternate_config.driver_profile.as_deref(),
+                        AgentMethod::TestConnection,
+                        agent_connect_params(
+                            &alternate_config,
+                            host,
+                            port,
+                            alternate_config.database.as_deref().unwrap_or(""),
+                        ),
+                        Some(agent_connect_timeout(&alternate_config)),
+                    )
+                    .await
+                    .map_err(|alternate_err| {
+                        format!("{err}\n\nFallback with alternate Oracle descriptor failed: {alternate_err}")
+                    })?
+            } else {
+                return Err(oracle_error_with_driver_hint(config, &err));
+            }
+        }
+    };
+
+    Ok(ConnectionTestResult::success("Connection successful")
+        .with_database_info(database_info_from_protocol_value(&response)))
+}
+
+async fn optional_mysql_database_info(
+    pool: &db::mysql::MySqlPool,
+    config: &ConnectionConfig,
+) -> Option<DatabaseConnectionInfo> {
+    match db::mysql::database_connection_info(pool, db::mysql::protocol_product_name(config)).await {
+        Ok(info) => Some(info),
+        Err(error) => {
+            log::warn!("Failed to read optional MySQL database information: {error}");
+            None
         }
     }
-
-    Ok("Connection successful".to_string())
 }
 
 async fn connect_agent_pool(
@@ -137,28 +160,27 @@ async fn connect_agent_pool(
         }
     }
 
-    Ok(PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client))))
+    Ok(PoolKind::agent(client))
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "sqlite-sqlcipher")]
-    use super::connect_sqlite_from_config;
-    use super::{
-        mark_mongo_legacy_driver, mongo_legacy_connect_params, MONGO_LEGACY_DRIVER_LABEL, MONGO_LEGACY_DRIVER_PROFILE,
-    };
-    use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
     #[cfg(feature = "mq-admin")]
-    use {
-        super::{load_connection_configs, save_connection_configs},
-        dbx_core::connection::{AppState, PoolKind},
-        dbx_core::storage::Storage,
+    use super::load_connection_configs;
+    use super::{
+        connect_sqlite_from_config, gaussdb_m_jdbc_command_config, mark_mongo_legacy_driver,
+        mongo_legacy_connect_params, persist_mongo_legacy_driver_profile, save_connection_configs,
+        MONGO_LEGACY_DRIVER_LABEL, MONGO_LEGACY_DRIVER_PROFILE,
     };
+    use dbx_core::connection::{AppState, PoolKind};
+    use dbx_core::models::connection::{AttachedDatabaseConfig, ConnectionConfig, DatabaseType};
+    use dbx_core::storage::Storage;
 
     fn mongodb_config() -> ConnectionConfig {
         ConnectionConfig {
             id: "mongo".to_string(),
             name: "MongoDB".to_string(),
+            note: String::new(),
             db_type: DatabaseType::MongoDb,
             driver_profile: Some("mongodb".to_string()),
             driver_label: Some("MongoDB".to_string()),
@@ -171,6 +193,7 @@ mod tests {
             database: Some("RestCloud_V45PUB_Gateway".to_string()),
             visible_databases: None,
             visible_schemas: None,
+            show_system_schemas: false,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -197,6 +220,7 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
             redis_scan_page_size: None,
+            redis_database_aliases: Default::default(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -207,10 +231,10 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            database_info: None,
         }
     }
 
-    #[cfg(feature = "sqlite-sqlcipher")]
     fn sqlite_config(path: &std::path::Path, password: &str) -> ConnectionConfig {
         let mut config = mongodb_config();
         config.id = "sqlite".to_string();
@@ -226,6 +250,91 @@ mod tests {
         config.database = None;
         config.connection_string = None;
         config
+    }
+
+    #[tokio::test]
+    async fn sqlite_connect_from_config_restores_attached_databases() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-sqlite-attach-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = dir.join("main.sqlite");
+        let attached_path = dir.join("analytics.sqlite");
+        drop(dbx_core::db::sqlite::connect_path_create_if_missing(main_path.to_str().unwrap()).await.unwrap());
+        let attached =
+            dbx_core::db::sqlite::connect_path_create_if_missing(attached_path.to_str().unwrap()).await.unwrap();
+        dbx_core::db::sqlite::execute_query(&attached, "CREATE TABLE events(id INTEGER PRIMARY KEY);").await.unwrap();
+        drop(attached);
+
+        let mut config = sqlite_config(&main_path, "");
+        config.attached_databases.push(AttachedDatabaseConfig {
+            name: "analytics".to_string(),
+            path: attached_path.to_string_lossy().to_string(),
+        });
+
+        let pool = connect_sqlite_from_config(&config).await.expect("open SQLite connection with attachments");
+        let count = pool
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT count(*) FROM analytics.sqlite_master WHERE type = 'table' AND name = 'events'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .expect("query attached SQLite database");
+        assert_eq!(count, 1);
+
+        drop(pool);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sqlite_connect_from_config_rejects_sqlcipher_attachments_before_opening_files() {
+        let mut config = sqlite_config(std::path::Path::new("/missing/main.sqlite"), "secret");
+        config.attached_databases.push(AttachedDatabaseConfig {
+            name: "analytics".to_string(),
+            path: "/missing/analytics.sqlite".to_string(),
+        });
+
+        let error = match connect_sqlite_from_config(&config).await {
+            Ok(_) => panic!("SQLCipher attachments must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("SQLCipher"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn saving_memory_sqlite_attachments_keeps_the_live_pool_intact() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-sqlite-memory-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let initial = sqlite_config(std::path::Path::new(":memory:"), "");
+        let pool = dbx_core::db::sqlite::connect_path(":memory:").await.unwrap();
+        dbx_core::db::sqlite::execute_query(
+            &pool,
+            "CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES ('yes');",
+        )
+        .await
+        .unwrap();
+        state.configs.write().await.insert(initial.id.clone(), initial.clone());
+        state.connections.write().await.insert(initial.id.clone(), PoolKind::Sqlite(pool.clone()));
+
+        let mut invalid = initial.clone();
+        invalid.attached_databases.push(AttachedDatabaseConfig {
+            name: "analytics".to_string(),
+            path: dir.join("analytics.sqlite").to_string_lossy().to_string(),
+        });
+        let error = save_connection_configs(&state, &[invalid]).await.unwrap_err();
+
+        assert!(error.contains("in-memory main database"), "{error}");
+        assert!(state.connections.read().await.contains_key(&initial.id));
+        assert_eq!(state.configs.read().await.get(&initial.id), Some(&initial));
+        let retained = dbx_core::db::sqlite::execute_query(&pool, "SELECT value FROM retained;").await.unwrap();
+        assert_eq!(retained.rows[0][0], serde_json::json!("yes"));
+
+        drop(pool);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(feature = "mq-admin")]
@@ -253,6 +362,28 @@ mod tests {
     }
 
     #[test]
+    fn gaussdb_m_commands_select_vendor_jdbc_config() {
+        let mut config = mongodb_config();
+        config.db_type = DatabaseType::Gaussdb;
+        config.driver_profile = Some("gaussdb-m".to_string());
+        config.host = "gaussdb.internal".to_string();
+        config.port = 8000;
+        config.database = Some("app".to_string());
+        config.url_params = None;
+        config.connection_string = None;
+
+        let jdbc = gaussdb_m_jdbc_command_config(&config, "127.0.0.1", 18000).unwrap();
+        assert_eq!(
+            jdbc.connection_string.as_deref(),
+            Some("jdbc:gaussdb://127.0.0.1:18000/app?sslmode=prefer&ssl=true")
+        );
+        assert_eq!(jdbc.jdbc_driver_class.as_deref(), Some("com.huawei.gaussdb.jdbc.Driver"));
+
+        config.driver_profile = Some("gaussdb".to_string());
+        assert!(gaussdb_m_jdbc_command_config(&config, "127.0.0.1", 18000).is_none());
+    }
+
+    #[test]
     fn mongo_legacy_connect_params_preserve_auth_options() {
         let config = mongodb_config();
 
@@ -274,6 +405,29 @@ mod tests {
         assert_eq!(config.driver_profile.as_deref(), Some(MONGO_LEGACY_DRIVER_PROFILE));
         assert_eq!(config.driver_label.as_deref(), Some(MONGO_LEGACY_DRIVER_LABEL));
         assert!(!mark_mongo_legacy_driver(&mut config));
+    }
+
+    #[tokio::test]
+    async fn persist_mongo_legacy_driver_profile_updates_only_the_target_connection() {
+        let dir = std::env::temp_dir().join(format!("dbx-tauri-mongo-profile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let mongo = mongodb_config();
+        let mut other = mongodb_config();
+        other.id = "other".to_string();
+        other.name = "Other MongoDB".to_string();
+        state.storage.save_connections(&[mongo.clone(), other.clone()]).await.unwrap();
+
+        persist_mongo_legacy_driver_profile(&state, &mongo).await.unwrap();
+
+        let saved = state.storage.load_connections().await.unwrap();
+        let updated = saved.iter().find(|config| config.id == mongo.id).unwrap();
+        assert_eq!(updated.driver_profile.as_deref(), Some(MONGO_LEGACY_DRIVER_PROFILE));
+        assert_eq!(updated.driver_label.as_deref(), Some(MONGO_LEGACY_DRIVER_LABEL));
+        assert_eq!(saved.iter().find(|config| config.id == other.id), Some(&other));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(feature = "sqlite-sqlcipher")]
@@ -334,7 +488,7 @@ mod tests {
         let first = state.mq_registry.get_or_build(&initial).await.unwrap();
 
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
-        save_connection_configs(&state, &[updated.clone()]).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&updated)).await.unwrap();
 
         let cached_admin_url = state
             .configs
@@ -363,7 +517,7 @@ mod tests {
         let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
         let initial = mq_config("mq-conn", "http://127.0.0.1:8080");
         let updated = mq_config("mq-conn", "http://127.0.0.1:8081");
-        state.storage.save_connections(&[updated.clone()]).await.unwrap();
+        state.storage.save_connections(std::slice::from_ref(&updated)).await.unwrap();
         state.configs.write().await.insert(initial.id.clone(), initial.clone());
         state.connections.write().await.insert(initial.id.clone(), PoolKind::MessageQueue);
 
@@ -401,7 +555,7 @@ mod tests {
         }
         let stale = state.mq_registry.get_or_build(&removed).await.unwrap();
 
-        save_connection_configs(&state, &[kept.clone()]).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&kept)).await.unwrap();
 
         let configs = state.configs.read().await;
         assert!(configs.contains_key(&kept.id));
@@ -430,7 +584,7 @@ mod tests {
         }
         state.connections.write().await.insert(removed.id.clone(), PoolKind::MessageQueue);
 
-        save_connection_configs(&state, &[kept.clone()]).await.unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&kept)).await.unwrap();
 
         assert!(!state.connections.read().await.contains_key(&removed.id));
 
@@ -445,6 +599,15 @@ pub async fn save_connections(state: State<'_, Arc<AppState>>, configs: Vec<Conn
 }
 
 async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> Result<(), String> {
+    for config in configs {
+        if config.db_type == DatabaseType::Sqlite {
+            db::sqlite::validate_persistent_attachments(
+                &config.host,
+                &config.password,
+                !config.attached_databases.is_empty(),
+            )?;
+        }
+    }
     state.storage.save_connections(configs).await?;
     let sync = sync_connection_configs(state, configs).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
@@ -567,16 +730,57 @@ fn sqlite_extension_specs_from_config(config: &ConnectionConfig) -> Vec<db::sqli
 }
 
 async fn connect_sqlite_from_config(config: &ConnectionConfig) -> Result<db::sqlite::SqliteHandle, String> {
-    db::sqlite::connect_path_with_cipher_key_and_extensions(
-        &expand_tilde(&config.host),
+    let sqlite_path = expand_tilde(&config.host);
+    db::sqlite::validate_persistent_attachments(&sqlite_path, &config.password, !config.attached_databases.is_empty())?;
+    let pool = db::sqlite::connect_path_with_cipher_key_and_extensions(
+        &sqlite_path,
         &config.password,
         sqlite_extension_specs_from_config(config),
     )
-    .await
+    .await?;
+    for attached in &config.attached_databases {
+        db::sqlite::attach_database(&pool, &attached.name, &expand_tilde(&attached.path))?;
+    }
+    Ok(pool)
+}
+
+async fn test_redis_connection(
+    state: &Arc<AppState>,
+    tunnel_id: &str,
+    config: &ConnectionConfig,
+    host: &str,
+    port: u16,
+    connect_timeout: std::time::Duration,
+) -> Result<String, String> {
+    // Connection tests must exercise the same Redis lifecycle as a saved connection,
+    // including compatibility auth, TLS, and database selection.
+    if config.uses_redis_cluster() {
+        drop(state.connect_redis_cluster(tunnel_id, config).await?);
+    } else if config.uses_redis_sentinel() {
+        drop(state.connect_redis_sentinel(tunnel_id, config).await?);
+    } else {
+        drop(db::redis_driver::connect_standalone(config, host, port, connect_timeout).await?);
+    }
+    Ok("Connection successful".to_string())
 }
 
 #[tauri::command]
 pub async fn test_connection(state: State<'_, Arc<AppState>>, config: ConnectionConfig) -> Result<String, String> {
+    test_connection_with_info_inner(state.inner(), config).await.map(|result| result.message)
+}
+
+#[tauri::command]
+pub async fn test_connection_with_info(
+    state: State<'_, Arc<AppState>>,
+    config: ConnectionConfig,
+) -> Result<ConnectionTestResult, String> {
+    test_connection_with_info_inner(state.inner(), config).await
+}
+
+async fn test_connection_with_info_inner(
+    state: &Arc<AppState>,
+    config: ConnectionConfig,
+) -> Result<ConnectionTestResult, String> {
     let tunnel_id = format!("{}:test", config.id);
     let has_transport_layers = config.has_effective_transport_layers();
     let connection_id = if has_transport_layers { tunnel_id.as_str() } else { config.id.as_str() };
@@ -586,13 +790,16 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
     let target = redacted_connection_url_for_endpoint(&config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(config.effective_connect_timeout_secs());
     let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
+    let gaussdb_m_jdbc_config = gaussdb_m_jdbc_command_config(&config, &host, port);
     log::info!("[test_connection] db_type={:?} target={}", config.db_type, target);
+    let mut database_info = None;
     let result = match probe_result {
         Err(e) => Err(e),
         Ok(()) => match config.db_type {
             DatabaseType::Mysql if config.needs_bare_mysql() && !config.bare_mysql_uses_tls() => {
                 match db::mysql::connect_bare(&url, connect_timeout).await {
                     Ok(pool) => {
+                        database_info = optional_mysql_database_info(&pool, &config).await;
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
                     }
@@ -611,6 +818,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 .await
                 {
                     Ok(pool) => {
+                        database_info = optional_mysql_database_info(&pool, &config).await;
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
                     }
@@ -620,6 +828,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             DatabaseType::Mysql => {
                 match db::mysql::connect_with_ca_cert(&url, Some(&config.ca_cert_path), connect_timeout).await {
                     Ok(pool) => {
+                        database_info = optional_mysql_database_info(&pool, &config).await;
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
                     }
@@ -629,6 +838,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             DatabaseType::Doris | DatabaseType::ManticoreSearch => {
                 match db::mysql::connect_bare(&url, connect_timeout).await {
                     Ok(pool) => {
+                        database_info = optional_mysql_database_info(&pool, &config).await;
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
                     }
@@ -651,10 +861,23 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 };
                 match connect {
                     Ok(pool) => {
+                        database_info = optional_mysql_database_info(&pool, &config).await;
                         let _ = pool.disconnect().await;
                         Ok("Connection successful".to_string())
                     }
                     Err(e) => Err(e),
+                }
+            }
+            DatabaseType::Gaussdb if gaussdb_m_jdbc_config.is_some() => {
+                match state
+                    .test_external_driver_with_info("jdbc", gaussdb_m_jdbc_config.as_ref().expect("checked above"))
+                    .await
+                {
+                    Ok(details) => {
+                        database_info = details.database_info;
+                        Ok(details.message)
+                    }
+                    Err(err) => Err(err),
                 }
             }
             DatabaseType::Postgres
@@ -674,25 +897,17 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 Err(e) => Err(e),
             },
             DatabaseType::Redis => {
-                let con = if config.uses_redis_cluster() {
-                    state.connect_redis_cluster(&tunnel_id, &config).await?;
-                    return Ok("Connection successful".to_string());
-                } else if config.uses_redis_sentinel() {
-                    state.connect_redis_sentinel(&tunnel_id, &config).await?;
-                    return Ok("Connection successful".to_string());
-                } else {
-                    db::redis_driver::connect(&url, connect_timeout).await?
-                };
-                drop(con);
-                Ok("Connection successful".to_string())
+                // Keep the result inside the outer lifecycle so temporary transports
+                // are reset after both successful and failed Redis tests.
+                test_redis_connection(state, &tunnel_id, &config, &host, port, connect_timeout).await
             }
-            #[cfg(feature = "duckdb-bundled")]
+            #[cfg(feature = "duckdb-sidecar")]
             DatabaseType::DuckDb => {
                 state.test_duckdb_connection_config(&config).await?;
                 Ok("Connection successful".to_string())
             }
-            #[cfg(not(feature = "duckdb-bundled"))]
-            DatabaseType::DuckDb => Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
+            #[cfg(not(feature = "duckdb-sidecar"))]
+            DatabaseType::DuckDb => Err("DuckDB support is not compiled in this build".to_string()),
             DatabaseType::MongoDb => {
                 if mongo_uses_legacy_driver(&config) {
                     let am = &state.agent_manager;
@@ -702,7 +917,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                         .await
                         .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
                     client.disconnect().await.ok();
-                    return Ok("Connection successful (via legacy driver)".to_string());
+                    return Ok(ConnectionTestResult::success("Connection successful (via legacy driver)"));
                 }
 
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
@@ -710,7 +925,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                         match db::mongo_driver::test_connection(&client, connect_timeout, config.effective_database())
                             .await
                         {
-                            Ok(()) => return Ok("Connection successful".to_string()),
+                            Ok(()) => return Ok(ConnectionTestResult::success("Connection successful")),
                             Err(e) => e,
                         }
                     }
@@ -739,6 +954,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     username,
                     password,
                     Some(&config.ca_cert_path),
+                    config.url_params.as_deref(),
                     connect_timeout,
                 )?;
                 db::clickhouse_driver::test_connection(&client, connect_timeout)
@@ -746,7 +962,13 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .map(|_| "Connection successful".to_string())
             }
             DatabaseType::SqlServer => {
-                state.test_sqlserver_connection_with_legacy_fallback(&config, &host, port, connect_timeout).await
+                match state.test_sqlserver_connection_with_info(&config, &host, port, connect_timeout).await {
+                    Ok(details) => {
+                        database_info = details.database_info;
+                        Ok(details.message)
+                    }
+                    Err(err) => Err(err),
+                }
             }
             DatabaseType::Elasticsearch => {
                 let mut client = db::elasticsearch_driver::EsClient::from_config(
@@ -755,9 +977,36 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     Some(&config.password),
                     config.ssl,
                     config.url_params.as_deref(),
+                    config.external_config.as_ref(),
                     connect_timeout,
                 );
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
+            DatabaseType::Easysearch => {
+                let mut client = db::easysearch_driver::EasysearchClient::from_config(
+                    &url,
+                    Some(&config.username),
+                    Some(&config.password),
+                    config.ssl,
+                    config.url_params.as_deref(),
+                    config.external_config.as_ref(),
+                    connect_timeout,
+                );
+                db::easysearch_driver::test_connection(&mut client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
+            DatabaseType::Hbase => {
+                let client = db::hbase_driver::HBaseClient::new(
+                    &url,
+                    Some(&config.username),
+                    Some(&config.password),
+                    false,
+                    connect_timeout,
+                )?;
+                db::hbase_driver::test_connection(&client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
             }
@@ -837,8 +1086,8 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
                 let mqc = state.mq_admin_config_for_connection(connection_id, &config).await?;
-                let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
-                let adapter = match state.mq_registry.get_or_build_config(connection_id, mqc, kafka_launch).await {
+                let agent_launch = dbx_core::mq::service::resolve_mq_agent_launch_spec(&mqc, state);
+                let adapter = match state.mq_registry.get_or_build_config(connection_id, mqc, agent_launch).await {
                     Ok(adapter) => adapter,
                     Err(err) => {
                         state.mq_registry.drop_connection(connection_id).await;
@@ -857,11 +1106,23 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .to_string())
             }
             db_type if database_capabilities::is_agent_type(&db_type) => {
-                test_agent_connection(state.inner(), &config, &host, port).await
+                match test_agent_connection(state, &config, &host, port).await {
+                    Ok(details) => {
+                        database_info = details.database_info;
+                        Ok(details.message)
+                    }
+                    Err(err) => Err(err),
+                }
             }
             DatabaseType::PrestoSql => {
                 let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, &host, port);
-                state.test_external_driver("jdbc", &jdbc_config).await
+                match state.test_external_driver_with_info("jdbc", &jdbc_config).await {
+                    Ok(details) => {
+                        database_info = details.database_info;
+                        Ok(details.message)
+                    }
+                    Err(err) => Err(err),
+                }
             }
             DatabaseType::Jdbc => {
                 let mut jdbc_config = config.clone();
@@ -870,7 +1131,13 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                         jdbc_config.connection_string = Some(rewrite_jdbc_url_host(url, &host, port));
                     }
                 }
-                state.test_external_driver("jdbc", &jdbc_config).await
+                match state.test_external_driver_with_info("jdbc", &jdbc_config).await {
+                    Ok(details) => {
+                        database_info = details.database_info;
+                        Ok(details.message)
+                    }
+                    Err(err) => Err(err),
+                }
             }
             db_type => Err(format!("Unsupported database type: {db_type:?}")),
         },
@@ -880,7 +1147,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
         state.reset_connection_transport_for_config(&tunnel_id, &config).await;
     }
 
-    result
+    result.map(|message| ConnectionTestResult::success(message).with_database_info(database_info))
 }
 
 #[tauri::command]
@@ -890,6 +1157,13 @@ pub async fn connect_db(
     client_attempt: Option<u64>,
 ) -> Result<String, String> {
     let config = config.canonicalized();
+    if config.db_type == DatabaseType::Sqlite {
+        db::sqlite::validate_persistent_attachments(
+            &config.host,
+            &config.password,
+            !config.attached_databases.is_empty(),
+        )?;
+    }
     let id = config.id.clone();
     let db_config = metadata_connection_config(&config);
     let attempt = state.begin_connection_attempt_with_client_attempt(&id, client_attempt).await;
@@ -912,6 +1186,7 @@ pub async fn connect_db(
     let url = connection_url_for_endpoint(&db_config, &host, port);
     let connect_timeout = std::time::Duration::from_secs(db_config.effective_connect_timeout_secs());
     let idle_timeout = std::time::Duration::from_secs(db_config.idle_timeout_secs);
+    let gaussdb_m_jdbc_config = gaussdb_m_jdbc_command_config(&db_config, &host, port);
 
     let pool = match db_config.db_type {
         DatabaseType::Mysql => {
@@ -923,6 +1198,9 @@ pub async fn connect_db(
             connect_bare_metadata_pool(&db_config, &host, port, connect_timeout, 3).await?,
             MysqlMode::Bare,
         ),
+        DatabaseType::Gaussdb if gaussdb_m_jdbc_config.is_some() => {
+            state.external_driver_pool("jdbc", gaussdb_m_jdbc_config.as_ref().expect("checked above")).await?
+        }
         DatabaseType::Postgres
         | DatabaseType::Redshift
         | DatabaseType::Gaussdb
@@ -941,27 +1219,15 @@ pub async fn connect_db(
                 )))
             } else {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
-                    db::redis_driver::connect(&url, connect_timeout).await?,
+                    db::redis_driver::connect_standalone(&db_config, &host, port, connect_timeout).await?,
                 )))
             };
             con
         }
-        #[cfg(feature = "duckdb-bundled")]
-        DatabaseType::DuckDb => {
-            let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
-            {
-                let locked = con.lock().map_err(|e| e.to_string())?;
-                for attached in &db_config.attached_databases {
-                    dbx_core::schema::duckdb_attach_database(&locked, &attached.name, &expand_tilde(&attached.path))?;
-                }
-                if let Some(script) = db_config.init_script.as_deref() {
-                    db::duckdb_driver::run_init_script(&locked, script)?;
-                }
-            }
-            PoolKind::DuckDb(con)
-        }
-        #[cfg(not(feature = "duckdb-bundled"))]
-        DatabaseType::DuckDb => return Err("DuckDB support not compiled (enable duckdb-bundled feature)".to_string()),
+        #[cfg(feature = "duckdb-sidecar")]
+        DatabaseType::DuckDb => state.create_duckdb_pool(&db_config).await?,
+        #[cfg(not(feature = "duckdb-sidecar"))]
+        DatabaseType::DuckDb => return Err("DuckDB support is not compiled in this build".to_string()),
         DatabaseType::MongoDb => {
             if mongo_uses_legacy_driver(&db_config) {
                 let mut client =
@@ -972,7 +1238,7 @@ pub async fn connect_db(
                     .await
                     .map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
                 state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
-                PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+                PoolKind::agent(client)
             } else {
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
                     Ok(client) => {
@@ -1019,10 +1285,10 @@ pub async fn connect_db(
                         )
                     })?;
                     state.ensure_current_connection_attempt(&id, Some(attempt)).await?;
+                    persist_mongo_legacy_driver_profile(state.inner(), &connected_config).await?;
                     mark_mongo_legacy_driver(&mut connected_config);
                     connected_db_config = metadata_connection_config(&connected_config);
-                    persist_mongo_legacy_driver_profile(state.inner(), &connected_config).await?;
-                    PoolKind::Agent(std::sync::Arc::new(tokio::sync::Mutex::new(client)))
+                    PoolKind::agent(client)
                 } else {
                     return Err(native_err);
                 }
@@ -1037,14 +1303,13 @@ pub async fn connect_db(
                 username,
                 password,
                 Some(&db_config.ca_cert_path),
+                db_config.url_params.as_deref(),
                 connect_timeout,
             )?;
             db::clickhouse_driver::test_connection(&client, connect_timeout).await?;
             PoolKind::ClickHouse(client)
         }
-        DatabaseType::SqlServer => {
-            state.connect_sqlserver_pool_with_legacy_fallback(&db_config, &host, port, connect_timeout).await?
-        }
+        DatabaseType::SqlServer => state.connect_sqlserver_pool(&db_config, &host, port, connect_timeout).await?,
         DatabaseType::Elasticsearch => {
             let mut client = db::elasticsearch_driver::EsClient::from_config(
                 &url,
@@ -1052,10 +1317,35 @@ pub async fn connect_db(
                 Some(&db_config.password),
                 db_config.ssl,
                 db_config.url_params.as_deref(),
+                db_config.external_config.as_ref(),
                 connect_timeout,
             );
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
+        }
+        DatabaseType::Easysearch => {
+            let mut client = db::easysearch_driver::EasysearchClient::from_config(
+                &url,
+                Some(&db_config.username),
+                Some(&db_config.password),
+                db_config.ssl,
+                db_config.url_params.as_deref(),
+                db_config.external_config.as_ref(),
+                connect_timeout,
+            );
+            db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
+            PoolKind::Easysearch(client)
+        }
+        DatabaseType::Hbase => {
+            let client = db::hbase_driver::HBaseClient::new(
+                &url,
+                Some(&db_config.username),
+                Some(&db_config.password),
+                false,
+                connect_timeout,
+            )?;
+            db::hbase_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::HBase(client)
         }
         DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
             let kind = match db_config.db_type {
@@ -1129,8 +1419,8 @@ pub async fn connect_db(
         #[cfg(feature = "mq-admin")]
         DatabaseType::MessageQueue => {
             let mqc = state.mq_admin_config_for_connection(&id, &config).await?;
-            let kafka_launch = dbx_core::mq::service::resolve_kafka_launch_spec(&mqc, &state);
-            let adapter = match state.mq_registry.get_or_build_config(&id, mqc, kafka_launch).await {
+            let agent_launch = dbx_core::mq::service::resolve_mq_agent_launch_spec(&mqc, &state);
+            let adapter = match state.mq_registry.get_or_build_config(&id, mqc, agent_launch).await {
                 Ok(adapter) => adapter,
                 Err(err) => {
                     state.mq_registry.drop_connection(&id).await;
@@ -1189,6 +1479,13 @@ pub async fn connection_final_proxy_port(
     if !runtime_config.has_effective_transport_layers() {
         return Err("Connection has no configured transport layers".to_string());
     }
+    if runtime_config.db_type == DatabaseType::Sqlite {
+        db::sqlite::validate_persistent_attachments(
+            &runtime_config.host,
+            &runtime_config.password,
+            !runtime_config.attached_databases.is_empty(),
+        )?;
+    }
 
     let connection_id = runtime_config.id.clone();
     let db_config = metadata_connection_config(&runtime_config);
@@ -1213,6 +1510,7 @@ pub async fn disconnect_db(
     if !should_disconnect {
         return Ok(());
     }
+    state.running_queries.cancel_connection(&connection_id);
     state.remove_connection_pools_detached(&connection_id).await;
     drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     drop_mq_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
@@ -1252,6 +1550,24 @@ pub async fn connection_identifier_quote(
     database: Option<String>,
 ) -> Result<Option<String>, String> {
     state.connection_identifier_quote(&connection_id, database.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn connection_database_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database: Option<String>,
+) -> Result<Option<DatabaseConnectionInfo>, String> {
+    state.connection_database_info(&connection_id, database.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn save_connection_database_info(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    database_info: Option<DatabaseConnectionInfo>,
+) -> Result<(), String> {
+    state.save_connection_database_info(&connection_id, database_info).await
 }
 
 /// Check whether a connection has read-only protection enabled.

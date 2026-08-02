@@ -1,4 +1,7 @@
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::{net::Ipv4Addr, net::TcpListener};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
@@ -7,10 +10,47 @@ use axum::routing::get;
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use tauri::async_runtime::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use dbx_core::connection::AppState;
 
 const DEFAULT_PUBSUB_PORT: u16 = 4224;
+
+pub struct PubSubServerState {
+    port: Option<u16>,
+    shutdown: CancellationToken,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl PubSubServerState {
+    fn unavailable() -> Self {
+        Self { port: None, shutdown: CancellationToken::new(), task: Mutex::new(None) }
+    }
+
+    fn get(&self) -> Result<u16, String> {
+        self.port.ok_or_else(|| "Redis PubSub server is unavailable".to_string())
+    }
+
+    pub async fn shutdown(&self, deadline: Duration) {
+        self.shutdown.cancel();
+        let task = self.task.lock().unwrap_or_else(|error| error.into_inner()).take();
+        let Some(mut task) = task else { return };
+        if tokio::time::timeout(deadline, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for PubSubServerState {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if let Some(task) = self.task.get_mut().unwrap_or_else(|error| error.into_inner()).take() {
+            task.abort();
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,8 +67,24 @@ fn pubsub_server_port() -> u16 {
 }
 
 #[tauri::command]
-pub fn redis_pubsub_server_port() -> u16 {
-    pubsub_server_port()
+pub fn redis_pubsub_server_port(state: tauri::State<'_, PubSubServerState>) -> Result<u16, String> {
+    state.get()
+}
+
+fn bind_pubsub_listener(preferred_port: u16) -> Result<TcpListener, String> {
+    let preferred_addr = (Ipv4Addr::LOCALHOST, preferred_port);
+    match TcpListener::bind(preferred_addr) {
+        Ok(listener) => Ok(listener),
+        Err(preferred_error) if preferred_port != 0 => {
+            log::warn!(
+                "Failed to bind PubSub server on {preferred_addr:?}: {preferred_error}; using an available port instead"
+            );
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|fallback_error| {
+                format!("Failed to bind PubSub server on an available port: {fallback_error}")
+            })
+        }
+        Err(error) => Err(format!("Failed to bind PubSub server on {preferred_addr:?}: {error}")),
+    }
 }
 
 async fn ws_handler(
@@ -144,21 +200,84 @@ async fn handle_command(sink: &mut redis::aio::PubSubSink, text: &str) -> Result
 
 /// Start the embedded web server for PubSub WebSocket support.
 /// Runs on a background task using the shared AppState.
-pub fn start_pubsub_server(state: Arc<AppState>) {
+pub fn start_pubsub_server(state: Arc<AppState>) -> PubSubServerState {
     let router = build_pubsub_router(state);
-    tauri::async_runtime::spawn(async move {
-        let port = pubsub_server_port();
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
+    let listener = match bind_pubsub_listener(pubsub_server_port()) {
+        Ok(listener) => listener,
+        Err(error) => {
+            log::warn!("{error}");
+            return PubSubServerState::unavailable();
+        }
+    };
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            log::warn!("Failed to read PubSub server address: {error}");
+            return PubSubServerState::unavailable();
+        }
+    };
+    if let Err(error) = listener.set_nonblocking(true) {
+        log::warn!("Failed to configure PubSub server listener: {error}");
+        return PubSubServerState::unavailable();
+    }
+
+    start_pubsub_server_with_listener(listener, addr, router)
+}
+
+fn start_pubsub_server_with_listener(
+    listener: TcpListener,
+    addr: std::net::SocketAddr,
+    router: Router,
+) -> PubSubServerState {
+    let shutdown = CancellationToken::new();
+    let shutdown_signal = shutdown.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(listener) => listener,
             Err(error) => {
-                log::warn!("Failed to bind PubSub server on {addr}: {error}");
+                log::warn!("Failed to start PubSub server on {addr}: {error}");
                 return;
             }
         };
         log::info!("PubSub WebSocket server listening on {addr}");
-        if let Err(error) = axum::serve(listener, router).await {
+        if let Err(error) =
+            axum::serve(listener, router).with_graceful_shutdown(shutdown_signal.cancelled_owned()).await
+        {
             log::warn!("PubSub server stopped with error: {error}");
         }
     });
+
+    PubSubServerState { port: Some(addr.port()), shutdown, task: Mutex::new(Some(task)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bind_pubsub_listener, start_pubsub_server_with_listener};
+    use axum::Router;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::time::Duration;
+
+    #[test]
+    fn falls_back_to_an_available_local_port_when_the_preferred_port_is_in_use() {
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let preferred_port = occupied.local_addr().unwrap().port();
+
+        let listener = bind_pubsub_listener(preferred_port).unwrap();
+
+        assert_eq!(listener.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        assert_ne!(listener.local_addr().unwrap().port(), preferred_port);
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_listener_before_process_exit() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let state = start_pubsub_server_with_listener(listener, addr, Router::new());
+
+        state.shutdown(Duration::from_secs(1)).await;
+
+        let rebound = TcpListener::bind(addr).unwrap();
+        assert_eq!(rebound.local_addr().unwrap(), addr);
+    }
 }

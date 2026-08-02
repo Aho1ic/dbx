@@ -1,6 +1,7 @@
 import { strict as assert } from "node:assert";
 import { test } from "vitest";
 import { applyParsedConnectionUrl, normalizeMongoConnectionString, parseConnectionUrl } from "../../apps/desktop/src/lib/connection/connectionUrl.ts";
+import { connectionUrlPlaceholder } from "../../apps/desktop/src/lib/connection/connectionPresentation.ts";
 import { h2FileJdbcUrlWithPath } from "../../apps/desktop/src/lib/database/h2Connection.ts";
 
 test("parses postgres connection URLs", () => {
@@ -31,6 +32,44 @@ test("parses KWDB connection URLs", () => {
     urlParams: "sslmode=require",
     ssl: true,
   });
+});
+
+test("uses the Dameng display name without changing its connection profile", () => {
+  const parsed = parseConnectionUrl("dm://SYSDBA:password@127.0.0.1:5236/DAMENG");
+
+  assert.equal(parsed.dbType, "dameng");
+  assert.equal(parsed.driverProfile, "dm");
+  assert.equal(parsed.driverLabel, "达梦 Dameng");
+});
+
+test.each(["kingbase", "kingbase8", "jdbc:kingbase8"])("parses %s connection URLs as native KingBase connections", (scheme) => {
+  assert.deepEqual(parseConnectionUrl(`${scheme}://framework:secret@172.21.203.70:443/hq_official?sslmode=disable`), {
+    dbType: "kingbase",
+    driverProfile: "kingbase",
+    driverLabel: "KingBase",
+    host: "172.21.203.70",
+    port: 443,
+    username: "framework",
+    password: "secret",
+    database: "hq_official",
+    urlParams: "sslmode=disable",
+    ssl: false,
+  });
+});
+
+test("shows the vendor KingBase URL scheme in the connection form", () => {
+  assert.equal(connectionUrlPlaceholder("kingbase"), "kingbase8://user:password@host:54321/database");
+});
+
+test("applies a credential-free KingBase URL without clearing typed credentials", () => {
+  const parsed = parseConnectionUrl("kingbase8://172.21.203.70:443/hq_official");
+  const applied = applyParsedConnectionUrl({ name: "hq", db_type: "kingbase", username: "framework", password: "typed-secret" } as any, parsed);
+
+  assert.equal(applied.host, "172.21.203.70");
+  assert.equal(applied.port, 443);
+  assert.equal(applied.database, "hq_official");
+  assert.equal(applied.username, "framework");
+  assert.equal(applied.password, "typed-secret");
 });
 
 test("parses mysql URLs with encoded credentials", () => {
@@ -417,6 +456,18 @@ test("uses selected HTTP-compatible profile for HTTP URLs", () => {
   assert.equal(parsed.host, "search.example.com");
   assert.equal(parsed.port, 9243);
   assert.equal(parsed.ssl, true);
+});
+
+test("parses Easysearch URLs and keeps the selected HTTPS profile", () => {
+  const dedicated = parseConnectionUrl("easysearch://dbx_test:secret@search.example.com:9200");
+  const https = parseConnectionUrl("https://search.example.com:9243", "easysearch");
+
+  assert.equal(dedicated.dbType, "easysearch");
+  assert.equal(dedicated.driverProfile, "easysearch");
+  assert.equal(dedicated.username, "dbx_test");
+  assert.equal(https.dbType, "easysearch");
+  assert.equal(https.port, 9243);
+  assert.equal(https.ssl, true);
 });
 
 test("parses HTTPS ClickHouse URLs with selected profile", () => {

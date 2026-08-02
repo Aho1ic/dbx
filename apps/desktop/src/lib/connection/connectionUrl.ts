@@ -1,5 +1,6 @@
 import type { ConnectionConfig, DatabaseType } from "@/types/database";
 import { h2JdbcUrlHasPasswordParam, h2JdbcUrlHasUserParam, parseH2JdbcUrl } from "@/lib/database/h2Connection";
+import { damengSslFormConfig } from "@/lib/database/damengSslOptions";
 
 export interface ParsedConnectionUrl {
   name?: string;
@@ -31,6 +32,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   mariadb: { type: "mysql", profile: "mariadb", label: "MariaDB", defaultPort: 3306 },
   postgres: { type: "postgres", profile: "postgres", label: "PostgreSQL", defaultPort: 5432 },
   postgresql: { type: "postgres", profile: "postgres", label: "PostgreSQL", defaultPort: 5432 },
+  cloudberry: { type: "postgres", profile: "cloudberry", label: "Apache Cloudberry", defaultPort: 5432 },
   redshift: { type: "redshift", profile: "redshift", label: "Redshift", defaultPort: 5439 },
   redis: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
   rediss: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
@@ -43,12 +45,15 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   mssql: { type: "sqlserver", profile: "sqlserver", label: "SQL Server", defaultPort: 1433 },
   oracle: { type: "oracle", profile: "oracle", label: "Oracle", defaultPort: 1521 },
   elasticsearch: { type: "elasticsearch", profile: "elasticsearch", label: "Elasticsearch", defaultPort: 9200 },
+  easysearch: { type: "easysearch", profile: "easysearch", label: "Easysearch", defaultPort: 9200 },
   qdrant: { type: "qdrant", profile: "qdrant", label: "Qdrant", defaultPort: 6333 },
   milvus: { type: "milvus", profile: "milvus", label: "Milvus", defaultPort: 19530 },
   weaviate: { type: "weaviate", profile: "weaviate", label: "Weaviate", defaultPort: 8080 },
   chromadb: { type: "chromadb", profile: "chromadb", label: "ChromaDB", defaultPort: 8000 },
-  dm: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
-  dameng: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
+  dm: { type: "dameng", profile: "dm", label: "达梦 Dameng", defaultPort: 5236 },
+  dameng: { type: "dameng", profile: "dm", label: "达梦 Dameng", defaultPort: 5236 },
+  kingbase: { type: "kingbase", profile: "kingbase", label: "KingBase", defaultPort: 54321 },
+  kingbase8: { type: "kingbase", profile: "kingbase", label: "KingBase", defaultPort: 54321 },
   gaussdb: { type: "gaussdb", profile: "gaussdb", label: "GaussDB", defaultPort: 5432 },
   kwdb: { type: "kwdb", profile: "kwdb", label: "KWDB", defaultPort: 26257 },
   gbase: { type: "gbase", profile: "gbase", label: "GBase", defaultPort: 5258 },
@@ -68,6 +73,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
 const HTTP_SELECTED_PROFILES: Record<string, ConnectionProfile> = {
   clickhouse: SCHEME_PROFILES.clickhouse,
   elasticsearch: SCHEME_PROFILES.elasticsearch,
+  easysearch: SCHEME_PROFILES.easysearch,
   qdrant: SCHEME_PROFILES.qdrant,
   milvus: SCHEME_PROFILES.milvus,
   weaviate: SCHEME_PROFILES.weaviate,
@@ -223,6 +229,10 @@ function extractMysqlCredentialParams(params: string): { username?: string; pass
 }
 
 function urlParamsRequireTls(dbType: DatabaseType, params: string): boolean {
+  if (dbType === "dameng") {
+    return damengSslFormConfig(params).enabled;
+  }
+
   if (dbType === "mysql") {
     const requireSsl = queryParamValue(params, "require_ssl")?.toLowerCase();
     if (requireSsl === "true" || requireSsl === "1" || requireSsl === "yes") return true;
@@ -245,6 +255,10 @@ function isTidbCloudHost(host: string): boolean {
 export function connectionProfileForScheme(scheme: string, preferredProfile?: string): ConnectionProfile | undefined {
   if ((scheme === "http" || scheme === "https") && preferredProfile) {
     return HTTP_SELECTED_PROFILES[preferredProfile];
+  }
+  // Cloudberry uses PostgreSQL URLs, so keep the selected product profile when parsing a pasted URL.
+  if ((scheme === "postgres" || scheme === "postgresql") && preferredProfile === "cloudberry") {
+    return SCHEME_PROFILES.cloudberry;
   }
   return SCHEME_PROFILES[scheme];
 }
@@ -591,12 +605,18 @@ function applyParsedUsername(config: Omit<ConnectionConfig, "id">, parsed: Parse
   if (parsed.dbType === "h2" && config.db_type === "h2" && !h2JdbcUrlHasUserParam(parsed.connectionString)) {
     return config.username || parsed.username;
   }
+  if (parsed.dbType === "kingbase" && config.db_type === "kingbase" && !parsed.username) {
+    return config.username;
+  }
   return parsed.username;
 }
 
 function applyParsedPassword(config: Omit<ConnectionConfig, "id">, parsed: ParsedConnectionUrl): string {
   if (parsed.dbType === "h2" && config.db_type === "h2" && !h2JdbcUrlHasPasswordParam(parsed.connectionString)) {
     return config.password || parsed.password;
+  }
+  if (parsed.dbType === "kingbase" && config.db_type === "kingbase" && !parsed.password) {
+    return config.password;
   }
   return parsed.password;
 }

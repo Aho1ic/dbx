@@ -2,6 +2,7 @@
 node_modules/
 .claude/
 .codex/
+.workbuddy/
 .superpowers/
 .trellis/
 .worktrees/
@@ -22,6 +23,7 @@ docs/.next/
 docs/out/
 docs/.source/
 docs/superpowers/
+/docs/aegis/
 src-tauri/*.dylib
 
 # OS files
@@ -49,6 +51,10 @@ Thumbs.db
 # Temp
 tmp/
 
+# Code review tool artifacts
+review_diff.json
+review_classified.json
+
 # Logs
 *.log
 
@@ -63,4 +69,6 @@ DBX_*_x64-portable.zip
 .agents/skills
 .pnpm-store/*
 .dbx-web
-_dev
+# Local devtest connections (contains credentials; do not commit)
+dbx-devtest-connections.json
+.npmrc

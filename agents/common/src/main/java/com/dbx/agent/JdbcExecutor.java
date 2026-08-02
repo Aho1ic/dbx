@@ -6,16 +6,20 @@ import java.sql.Clob;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.sql.SQLXML;
 import java.sql.Statement;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 public final class JdbcExecutor {
     public static final JdbcExecutor INSTANCE = new JdbcExecutor();
@@ -70,11 +74,25 @@ public final class JdbcExecutor {
         int timeoutSecs,
         ResultValueReader valueReader
     ) {
+        return execute(conn, sql, schema, setSchemaSql, () -> "", maxRows, fetchSize, timeoutSecs, valueReader);
+    }
+
+    public QueryResult execute(
+        Connection conn,
+        String sql,
+        String schema,
+        Function<String, String> setSchemaSql,
+        Supplier<String> resetSchemaSql,
+        int maxRows,
+        Integer fetchSize,
+        int timeoutSecs,
+        ResultValueReader valueReader
+    ) {
         return unchecked(() -> {
             String trimmedSql = trimSql(sql);
             long start = System.currentTimeMillis();
 
-            applySchema(conn, schema, setSchemaSql);
+            applySchema(conn, schema, setSchemaSql, resetSchemaSql);
 
             try (Statement stmt = conn.createStatement()) {
                 activeStatements.add(stmt);
@@ -89,20 +107,22 @@ public final class JdbcExecutor {
                 // Do not translate them to Connection.commit(), which requires autoCommit=false.
                 boolean hasResultSet = stmt.execute(trimmedSql);
                 long elapsed = System.currentTimeMillis() - start;
+                QueryResult result;
                 if (hasResultSet) {
                     try (ResultSet rs = stmt.getResultSet()) {
-                        return readResultSet(rs, elapsed, effectiveMaxRows, valueReader);
+                        result = readResultSet(rs, elapsed, effectiveMaxRows, valueReader);
                     }
+                } else {
+                    int updateCount = stmt.getUpdateCount();
+                    result = new QueryResult(
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        updateCount >= 0 ? updateCount : 0,
+                        elapsed,
+                        false
+                    );
                 }
-
-                int updateCount = stmt.getUpdateCount();
-                return new QueryResult(
-                    Collections.emptyList(),
-                    Collections.emptyList(),
-                    updateCount >= 0 ? updateCount : 0,
-                    elapsed,
-                    false
-                );
+                return withStatementWarnings(result, stmt);
                 } finally {
                     activeStatements.remove(stmt);
                 }
@@ -178,7 +198,19 @@ public final class JdbcExecutor {
         QueryPageOptions options,
         ResultValueReader valueReader
     ) {
-        return executePage(conn, sql, schema, setSchemaSql, options, valueReader, sessions);
+        return executePage(conn, sql, schema, setSchemaSql, () -> "", options, valueReader, sessions);
+    }
+
+    public QueryPageResult executePage(
+        Connection conn,
+        String sql,
+        String schema,
+        Function<String, String> setSchemaSql,
+        Supplier<String> resetSchemaSql,
+        QueryPageOptions options,
+        ResultValueReader valueReader
+    ) {
+        return executePage(conn, sql, schema, setSchemaSql, resetSchemaSql, options, valueReader, sessions);
     }
 
     public QueryPageResult startTableRead(
@@ -189,7 +221,19 @@ public final class JdbcExecutor {
         QueryPageOptions options,
         ResultValueReader valueReader
     ) {
-        return executePage(conn, sql, schema, setSchemaSql, options, valueReader, tableReadSessions);
+        return executePage(conn, sql, schema, setSchemaSql, () -> "", options, valueReader, tableReadSessions);
+    }
+
+    public QueryPageResult startTableRead(
+        Connection conn,
+        String sql,
+        String schema,
+        Function<String, String> setSchemaSql,
+        Supplier<String> resetSchemaSql,
+        QueryPageOptions options,
+        ResultValueReader valueReader
+    ) {
+        return executePage(conn, sql, schema, setSchemaSql, resetSchemaSql, options, valueReader, tableReadSessions);
     }
 
     private QueryPageResult executePage(
@@ -197,6 +241,7 @@ public final class JdbcExecutor {
         String sql,
         String schema,
         Function<String, String> setSchemaSql,
+        Supplier<String> resetSchemaSql,
         QueryPageOptions options,
         ResultValueReader valueReader,
         ConcurrentHashMap<String, QuerySession> targetSessions
@@ -206,9 +251,10 @@ public final class JdbcExecutor {
             String trimmedSql = trimSql(sql);
             long start = System.currentTimeMillis();
 
-            applySchema(conn, schema, setSchemaSql);
+            applySchema(conn, schema, setSchemaSql, resetSchemaSql);
 
             Statement stmt = conn.createStatement();
+            QuerySession createdSession = null;
             activeStatements.add(stmt);
             try {
                 applyQueryTimeout(stmt, options.getTimeoutSecs());
@@ -258,9 +304,13 @@ public final class JdbcExecutor {
                     Math.max(options.getMaxRows(), 1),
                     valueReader
                 );
+                createdSession = session;
                 targetSessions.put(sessionId, session);
                 return readSessionPage(targetSessions, session, options.getPageSize(), elapsed);
             } catch (Exception e) {
+                if (createdSession != null) {
+                    closeSession(targetSessions, createdSession.id);
+                }
                 activeStatements.remove(stmt);
                 try {
                     stmt.close();
@@ -309,6 +359,23 @@ public final class JdbcExecutor {
         // session-owned cursors as part of the same cancellation boundary.
         closeAllQuerySessions();
         closeAllTableReadSessions();
+    }
+
+    public boolean hasOpenSessions() {
+        return !sessions.isEmpty() || !tableReadSessions.isEmpty();
+    }
+
+    public boolean hasActiveStatements() {
+        return !activeStatements.isEmpty();
+    }
+
+    public int expireIdleResources() {
+        return expireIdleQuerySessions() + expireIdleTableReadSessions();
+    }
+
+    int expireIdleResources(long nowMillis, long idleTimeoutMillis) {
+        return expireIdleQuerySessions(nowMillis, idleTimeoutMillis)
+            + expireIdleTableReadSessions(nowMillis, idleTimeoutMillis);
     }
 
     public int expireIdleQuerySessions() {
@@ -388,8 +455,10 @@ public final class JdbcExecutor {
             case Types.BINARY:
             case Types.VARBINARY:
             case Types.LONGVARBINARY:
-            case Types.BLOB:
                 value = bytesToHex(rs.getBytes(index));
+                break;
+            case Types.BLOB:
+                value = blobResultValue(rs, index);
                 break;
             case Types.SQLXML:
                 value = sqlXmlToString(rs.getSQLXML(index));
@@ -407,8 +476,10 @@ public final class JdbcExecutor {
             case Types.BINARY:
             case Types.VARBINARY:
             case Types.LONGVARBINARY:
-            case Types.BLOB:
                 value = bytesToHex(rs.getBytes(index));
+                break;
+            case Types.BLOB:
+                value = blobResultValue(rs, index);
                 break;
             case Types.SQLXML:
                 value = sqlXmlToString(rs.getSQLXML(index));
@@ -418,6 +489,17 @@ public final class JdbcExecutor {
                 break;
         }
         return rs.wasNull() ? null : value;
+    }
+
+    private static Object blobResultValue(ResultSet rs, int index) throws SQLException {
+        Object value = rs.getObject(index);
+        if (value instanceof Blob || value instanceof byte[]) {
+            return normalizeResultValue(value);
+        }
+        if (value == null && rs.wasNull()) {
+            return null;
+        }
+        return bytesToHex(rs.getBytes(index));
     }
 
     public static Object normalizeResultValue(Object value) throws SQLException {
@@ -471,7 +553,12 @@ public final class JdbcExecutor {
             throw new IllegalArgumentException(missingMessage);
         }
         synchronized (session) {
-            return readSessionPage(targetSessions, session, pageSize, 0L);
+            try {
+                return readSessionPage(targetSessions, session, pageSize, 0L);
+            } catch (RuntimeException | Error error) {
+                closeSession(targetSessions, sessionId);
+                throw error;
+            }
         }
     }
 
@@ -592,9 +679,14 @@ public final class JdbcExecutor {
         return Math.min(requestedRows, 1024);
     }
 
-    private void applySchema(Connection conn, String schema, Function<String, String> setSchemaSql) throws SQLException {
+    private void applySchema(
+        Connection conn,
+        String schema,
+        Function<String, String> setSchemaSql,
+        Supplier<String> resetSchemaSql
+    ) throws SQLException {
         try {
-            JdbcSchemaSwitcher.apply(conn, schema, setSchemaSql);
+            JdbcSchemaSwitcher.apply(conn, schema, setSchemaSql, resetSchemaSql);
         } catch (SQLException e) {
             throw e;
         } catch (Exception e) {
@@ -606,6 +698,39 @@ public final class JdbcExecutor {
         if (timeoutSecs > 0) {
             stmt.setQueryTimeout(timeoutSecs);
         }
+    }
+
+    private static QueryResult withStatementWarnings(QueryResult result, Statement stmt) {
+        if (!result.getColumns().isEmpty() || !result.getRows().isEmpty()) {
+            return result;
+        }
+
+        List<List<Object>> rows = new ArrayList<>();
+        try {
+            Set<SQLWarning> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+            for (SQLWarning warning = stmt.getWarnings(); warning != null && seen.add(warning); warning = warning.getNextWarning()) {
+                String message = warning.getMessage();
+                if (message != null && !message.trim().isEmpty()) {
+                    rows.add(Collections.singletonList(message));
+                }
+            }
+            stmt.clearWarnings();
+        } catch (SQLException ignored) {
+            // Warning retrieval is advisory; a driver bug here must not turn a
+            // successfully executed statement into a query failure.
+        }
+
+        if (rows.isEmpty()) {
+            return result;
+        }
+        return new QueryResult(
+            Collections.singletonList("Message"),
+            Collections.singletonList("nvarchar"),
+            rows,
+            result.getAffected_rows(),
+            result.getExecution_time_ms(),
+            result.getTruncated()
+        );
     }
 
     private QueryResult emptyQueryResult(long start) {

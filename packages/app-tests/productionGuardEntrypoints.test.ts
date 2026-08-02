@@ -44,7 +44,7 @@ test("secondary write entrypoints use the shared production SQL guard", () => {
       sourceKey: "production.sourceExtension",
     },
     {
-      path: "apps/desktop/src/components/sidebar/TreeItem.vue",
+      path: "apps/desktop/src/components/sidebar/SidebarTreeRuntimeHost.vue",
       executor: "api.executeQuery",
       sourceKey: "production.sourceSidebar",
     },
@@ -104,4 +104,47 @@ test("object browser batch empty reviews the frozen SQL plan before executing", 
   assert.match(body, /executeObjectBrowserSqlWithProductionGuard\(\s*reviewSql/, "batch empty must use the Object Browser production guard");
   assert.match(body, /runBatchTableEmpty/, "batch empty should still use the batch executor after confirmation");
   assert.ok(body.indexOf("executeObjectBrowserSqlWithProductionGuard") < body.indexOf("runBatchTableEmpty"), "production guard must be entered before the batch executor");
+});
+
+test("mongo sidebar mutations share the production-gated runMongoSidebarMutation shell", () => {
+  const shellSource = readSource("apps/desktop/src/lib/sidebar/runMongoSidebarMutation.ts");
+  assert.match(shellSource, /executeWithProductionContextGuard/, "shared mongo mutation shell must request production confirmation");
+  assert.match(shellSource, /return \{\s*result\s*\}/, "void execute success must be boxed so it is not treated as cancel");
+  assert.match(shellSource, /if \(executed === undefined\) return/, "only unboxed undefined from the guard means cancel");
+  assert.match(shellSource, /onSuccess\(executed\.result\)/, "onSuccess must receive the unboxed execute result");
+
+  const source = readSource("apps/desktop/src/composables/useSidebarDatabaseSpecificMutationRuntime.ts");
+  for (const name of ["confirmCreateMongoIndex", "confirmRenameMongoCollection", "confirmDropMongoCollection", "confirmDropMongoIndex", "confirmDropAllMongoIndexes", "confirmDropMongoDatabase"] as const) {
+    const body = functionBody(source, name);
+    assert.match(body, /runMongoSidebarMutation/, `${name} must use the shared mongo mutation shell`);
+    assert.ok(body.includes("production.sourceSidebar"), `${name} should label the confirmation source`);
+  }
+
+  assert.ok(source.includes("api.mongoRenameCollection"), "mongo rename should still call the rename API");
+  assert.ok(source.includes("api.mongoDropDatabase"), "mongo drop database should still call the drop API");
+
+  const hostSource = readSource("apps/desktop/src/components/sidebar/SidebarTreeRuntimeHost.vue");
+  const dropDatabaseBody = functionBody(hostSource, "confirmDropDatabase");
+  assert.match(dropDatabaseBody, /confirmDropMongoDatabase/, "host drop-database confirm should delegate mongo to the mutation runtime");
+  assert.ok(!dropDatabaseBody.includes("api.mongoDropDatabase"), "host drop-database confirm should not call mongo APIs directly");
+  const mongoCollectionMenuBody = functionBody(hostSource, "buildSpecialSidebarMenu");
+  assert.match(mongoCollectionMenuBody, /action:\s*dropAllMongoIndexes/, "collection context menu must keep the drop-all-indexes entrypoint");
+  const batchDropBody = functionBody(hostSource, "confirmBatchDrop");
+  assert.match(batchDropBody, /catch\s*\([^)]*\)\s*\{[\s\S]*?failedCount \+= groupTargets\.length/, "cross-collection index deletion must retain earlier successes after a group failure");
+  assert.match(batchDropBody, /droppedCount === 0[\s\S]*?throw firstGroupError/, "an entirely failed cross-collection request must preserve its original error");
+  assert.match(batchDropBody, /finally\s*\{[\s\S]*?refreshMongoIndexTreeAfterMutation/, "every attempted index group must force a metadata refresh");
+});
+
+test("mongo index query mutations refresh loaded metadata", () => {
+  const source = readSource("apps/desktop/src/stores/queryStore.ts");
+  const refreshBody = functionBody(source, "refreshLoadedMongoIndexesAfterMutation");
+  assert.match(refreshBody, /refreshLoadedMongoIndexes/, "MongoDB index metadata should refresh through the shared loader");
+
+  const dropIndexStart = source.indexOf('mongoCommand.kind === "dropIndex" || mongoCommand.kind === "dropIndexes"');
+  assert.notEqual(dropIndexStart, -1, "query execution should retain MongoDB index mutation handling");
+  const dropIndexEnd = source.indexOf('} else if (mongoCommand.kind === "dropCollection")', dropIndexStart);
+  assert.notEqual(dropIndexEnd, -1, "MongoDB index mutation branch should remain bounded");
+  const dropIndexBranch = source.slice(dropIndexStart, dropIndexEnd);
+  assert.match(dropIndexBranch, /api\.mongoDropIndexes/);
+  assert.match(dropIndexBranch, /finally\s*\{[\s\S]*?refreshLoadedMongoIndexesAfterMutation/);
 });
